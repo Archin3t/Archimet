@@ -1,10 +1,12 @@
 # Release status
 
-**[v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) is a prerelease for an installation trial, not a production release.** Its assets (Archimet `.deb`, the three exact upstream Kismet 2025-09-R1 packages, `SHA256SUMS`, Kismet source and licence notice) are what the install guide uses. A failed trial is fixed in a new version (5.3.0-2, …); published assets are never replaced under the same version.
+**[v5.3.0-2](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-2) is the current release.** Its assets (Archimet `.deb`, the three exact upstream Kismet 2025-09-R1 packages, `SHA256SUMS`, Kismet source and licence notice) are what the install guide uses. Published assets are never replaced under the same version; fixes ship as a new version.
+
+v5.3.0-1 (prerelease) was superseded after its installation trial on the reference Pi found two faults, both fixed in 5.3.0-2: the logger crashed on a fresh install (a developer home-folder path), and a Wi-Fi lock file left in `/tmp` by an older Kismet running as another account blocked capture. The self-test also now reports the setup lock correctly instead of as many failures.
 
 The 5.3 candidate passed isolated arm64 apt-policy tests, gateway write tests, account / setup-lock / HTTPS tests against a real Kismet, an unauthenticated route audit and an API compatibility check. These are valuable checks, but they do not prove a fresh user installation on Pi hardware.
 
-The outstanding release gates are: a clean install from documented assets on a freshly imaged supported Pi; migration and reboot on the reference Pi; stable capture power without under-voltage; investigation of the `rtw88` channel-hop warnings; real-phone layout; hotspot separation; local HTTPS from another device; and review of the public source/package for secrets, licensing and install reproducibility. The requested `archimet`/`archimet` initial login with a forced password change is implemented and tested in isolation; it still needs the fresh-install hardware test.
+Still open on hardware: stable capture power without under-voltage over several days; the `rtw88` channel-hop warnings on 5 GHz channel 165; real-phone layout review; hotspot failover (on when Ethernet is unplugged, off when it returns); local HTTPS from a second device; and a clean install on a freshly imaged Pi (the reference Pi was cleaned of the old installation, not reimaged).
 
 Each release should carry exact package versions, checksums, test results and known limits. Current private Pi measurements and backup details remain outside the proposed public repository.
 

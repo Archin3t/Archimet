@@ -412,10 +412,10 @@ class Gateway(unittest.TestCase):
             self.assertIn("Secure", cookies[0])
             # Plain HTTP on the HTTPS port: a redirect, not a TLS error.
             with socket.create_connection(("127.0.0.1", srv.server_port)) as s:
-                s.sendall(b"GET /devices HTTP/1.1\r\nHost: kismetpi.local:2501\r\n\r\n")
+                s.sendall(b"GET /devices HTTP/1.1\r\nHost: archimet.example:2501\r\n\r\n")
                 head = s.recv(4096).decode()
             self.assertTrue(head.startswith("HTTP/1.1 301"), head)
-            self.assertIn("Location: https://kismetpi.local:", head)
+            self.assertIn("Location: https://archimet.example:", head)
             # A client that connects and never sends anything does not block anyone else.
             stall = socket.create_connection(("127.0.0.1", srv.server_port))
             try:

@@ -6,7 +6,7 @@ Archimet grew from a practical gap: general radio monitoring could show nearby W
 
 ![Archimet startup animation showing the title and Archinet credit](docs/intro.gif)
 
-> **Release status:** [v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) is a **prerelease for an installation trial**: the Archimet `.deb`, the exact tested Kismet packages, checksums and the Kismet source are attached, and the [install guide](docs/INSTALL.md) uses only those files. It is not yet a production release: the real-hardware gates in [release status](docs/STATUS.md) (power stability, real phone, second-device HTTPS, hotspot) are still open.
+> **Current release:** [v5.3.0-2](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-2). The Archimet `.deb`, the exact tested Kismet packages, checksums and the Kismet source are attached, and the [install guide](docs/INSTALL.md) uses only those files. Hardware checks still open on the reference Pi (long-run power stability, real-phone layout, HTTPS from a second device, hotspot failover) are listed in [release status](docs/STATUS.md).
 
 ## What it does
 

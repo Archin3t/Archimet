@@ -1,9 +1,8 @@
 # Installation guide
 
-**Current release: [v5.3.0-1 (prerelease, installation trial)](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1).**
-It is published for testing on real hardware; it becomes a normal release only after the release gates in
-[STATUS.md](STATUS.md) pass. Everything you need is attached to that release: the Archimet package, the three
-exact upstream Kismet packages it was tested with, one checksum file, and the Kismet source and licence notice.
+**Current release: [v5.3.0-2](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-2).** Everything you need is attached to that release: the
+Archimet package, the three exact upstream Kismet packages it was tested with, one checksum file, and the Kismet
+source and licence notice. Hardware checks still open are in [STATUS.md](STATUS.md).
 
 ## Before you start
 
@@ -39,12 +38,15 @@ rm -r --one-file-system -- ~/kismet-logs ~/.kismet        # the old Kismet accou
 sudo systemctl daemon-reload
 ```
 
+If the old Kismet ran as a different account, its Wi-Fi lock file in `/tmp` would block the new one;
+the package removes it when it is stale (or reboot once, which clears `/tmp`).
+
 ## 1. Download and verify
 
 ```sh
-mkdir -p ~/archimet-5.3.0-1 && cd ~/archimet-5.3.0-1
-base=https://github.com/Archin3t/Archimet/releases/download/v5.3.0-1
-for f in SHA256SUMS archimet_5.3.0-1_arm64.deb kismet-core_2025-09-R1_arm64.deb \
+mkdir -p ~/archimet-5.3.0-2 && cd ~/archimet-5.3.0-2
+base=https://github.com/Archin3t/Archimet/releases/download/v5.3.0-2
+for f in SHA256SUMS archimet_5.3.0-2_arm64.deb kismet-core_2025-09-R1_arm64.deb \
          kismet-capture-linux-wifi_2025-09-R1_arm64.deb kismet-capture-linux-bluetooth_2025-09-R1_arm64.deb; do
     wget -q --show-progress "$base/$f" || echo "MISSING: $f"
 done
@@ -59,7 +61,7 @@ the matching Kismet source archive and licence notice (GPL v2). Archimet adds no
 ```sh
 sudo apt install --no-install-recommends ./kismet-core_2025-09-R1_arm64.deb \
     ./kismet-capture-linux-wifi_2025-09-R1_arm64.deb ./kismet-capture-linux-bluetooth_2025-09-R1_arm64.deb \
-    ./archimet_5.3.0-1_arm64.deb
+    ./archimet_5.3.0-2_arm64.deb
 ```
 
 Read apt's list before accepting: it should install these four plus ordinary Debian libraries, and nothing else
@@ -74,8 +76,10 @@ account `archimet` / `archimet` (setup-only, below), and holds the three Kismet 
 
 ## 3. Capture sources
 
+Archimet's commands live in `/usr/sbin`, so run them with `sudo` from your normal account.
+
 ```sh
-archimet-setup detect                      # radios and their roles; wlan0 is always reserved
+sudo archimet-setup detect                      # radios and their roles; wlan0 is always reserved
 ```
 
 Create `/etc/kismet/kismet_site.conf` with your **capture** radios only (check the names `detect` printed):
@@ -105,7 +109,7 @@ account is separate from your Linux login.
 ## 5. Use it from other devices (local HTTPS)
 
 ```sh
-archimet-tls status          # names / addresses covered and the CA fingerprint
+sudo archimet-tls status          # names / addresses covered and the CA fingerprint
 ```
 
 Install the Pi's CA certificate once on each computer or phone (download `https://<pi>:2501/archimet-ca.crt`,
@@ -116,7 +120,7 @@ Pi's name or address changes: `sudo archimet-tls renew`.
 
 ```sh
 sudo archimet-selftest       # must end in ALL PASS
-archimet-hold status         # the three Kismet packages: tested version, held
+sudo archimet-hold status         # the three Kismet packages: tested version, held
 ```
 
 Open Sources: each capture source should say **capturing** (packet count rising). Reboot once and run the self-test

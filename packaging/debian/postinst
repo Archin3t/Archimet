@@ -99,6 +99,15 @@ EOF
         echo "archimet: disabled the pre-package kismet-device-logger.service (replaced by archimet-logger)"
     fi
 
+    # Kismet's Wi-Fi helper uses one fixed lock file in /tmp. One left by Kismet running as another
+    # account (an older setup) cannot be reopened by $U, and every Wi-Fi source then fails with
+    # "Could not acquire the interface lockfile". Remove it only when no Wi-Fi helper is running.
+    L=/tmp/.kismet_cap_linux_wifi_interface_lock
+    if [ -f "$L" ] && [ ! -L "$L" ] && [ "$(stat -c %U "$L")" != "$U" ] && command -v pgrep >/dev/null \
+       && ! pgrep -f '^/usr/bin/kismet_cap_linux_wifi' >/dev/null 2>&1; then
+        rm -f "$L"
+    fi
+
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload
         systemctl enable kismet.service archimet-logger.service archimet-gateway.service >/dev/null 2>&1 || true

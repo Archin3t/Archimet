@@ -50,4 +50,4 @@ The Archive screen provides authenticated, read-only search, sort and paging **p
 
 ## Is this release ready to install from GitHub?
 
-Yes, as a **prerelease for testing**: [v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) has the `.deb`, the exact Kismet packages and checksums, and the [Install](INSTALL.md) guide uses only those. It is not yet a production release; [Status](STATUS.md) lists the open hardware gates.
+Yes: [v5.3.0-2](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-2) has the `.deb`, the exact Kismet packages and checksums, and the [Install](INSTALL.md) guide uses only those. [Status](STATUS.md) lists the hardware checks still open.

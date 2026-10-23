@@ -126,7 +126,7 @@ def status():
         return 1
     txt = run(["openssl", "x509", "-in", str(DIR / "server.crt"), "-noout", "-enddate", "-ext", "subjectAltName"]).stdout
     end = txt.split("notAfter=")[1].splitlines()[0].strip()
-    left = (datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - datetime.datetime.utcnow()).days
+    left = (datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)).days
     dns, ips = names()
     covered = txt.split("Subject Alternative Name:")[-1]
     missing = [n for n in dns + ips if f"DNS:{n}" not in covered and f"IP Address:{n}" not in covered]

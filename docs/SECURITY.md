@@ -61,7 +61,7 @@ The capture helpers run with the privileges Kismet's packages give them (group `
 Other devices are served **only over HTTPS**; until a certificate exists the gateway serves the Pi
 itself (loopback) only, and plain `http://` on port 2501 is redirected without data. The package runs
 `archimet-tls init` at install: a local CA and the Pi's certificate in `/etc/archimet/tls`, handed to the
-gateway by systemd (`LoadCredential=`), no manual unit edits. `archimet-tls status` shows the names
+gateway by systemd (`LoadCredential=`), no manual unit edits. `sudo archimet-tls status` shows the names
 covered and the CA fingerprint; `sudo archimet-tls renew` re-issues the certificate for new addresses with
 the same CA. The CA is name-constrained to local names and private / loopback addresses, `ca.key` stays
 on the Pi (mode 600), and no internet, ACME or OCSP is needed. TLS 1.2 or newer. Trusting the CA on each
@@ -76,11 +76,12 @@ handshake-stalling client; whether TLS was tested end to end on the Pi is stated
   local HTTPS before signing in across a network.
 - Kismet stays on its tested version until a new Archimet release (UPDATES.md: security cost).
 - A user with root on the Pi can read the login file and all data; protect SSH access.
-- Backups (`tools/offpi_backup.py`) contain the login and captured data: keep them private.
+- Backups ([DATA.md](DATA.md#backups)) contain the login, the local CA key and captured data: keep them private.
 
 ## Verification
 
 The release report lists, for each release, the route audit (every Kismet and logger route,
 anonymous and signed-in, over Ethernet and the hotspot), the write tests on an isolated instance,
-the account / setup-lock / HTTPS test against a real Kismet (`tools/account_tls_test.py`), and
+the account / setup-lock / HTTPS test against a real Kismet (maintainer test tools, not in this
+repository), and
 `archimet-selftest`.

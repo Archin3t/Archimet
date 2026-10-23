@@ -1,6 +1,6 @@
 # Features and data sources
 
-Archimet is a focused interface and data layer over Kismet. The descriptions below refer to the local 5.3.0-1 candidate. See [release status](STATUS.md) before treating a feature as verified on a fresh Pi installation.
+Archimet is a focused interface and data layer over Kismet. The descriptions below refer to release 5.3.0-2. See [release status](STATUS.md) before treating a feature as verified on a fresh Pi installation.
 
 ## Capture and device views
 

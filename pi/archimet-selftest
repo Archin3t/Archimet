@@ -53,10 +53,10 @@ def code(url, method="GET"):
     try:
         with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=6,
                                     context=CTX if url.startswith("https:") else None) as r:
-            return r.status, r.read(400)
+            return r.status, r.read(65536)
     except urllib.error.HTTPError as e:
         with e:
-            return e.code, b""
+            return e.code, e.read(65536)
     except (urllib.error.URLError, OSError):
         return 0, b""
 
@@ -107,7 +107,9 @@ def main():
 
     # Setup and HTTPS (the gateway serves other devices only when both are done).
     acct = subprocess.run(["python3", "/usr/lib/archimet/archimet-account", "status"], capture_output=True, text=True)
-    check("setup finished: the default password is not active", acct.returncode == 0, acct.stdout.strip())
+    setup = acct.returncode != 0
+    check("setup finished: the default password is not active", not setup,
+          acct.stdout.strip() + " Finish it (INSTALL.md section 4); meanwhile the checks below expect the setup lock.")
     tls = subprocess.run(["python3", "/usr/lib/archimet/archimet-tls", "status"], capture_output=True, text=True)
     check("HTTPS certificate present, valid and covering this Pi's addresses", tls.returncode == 0,
           (tls.stdout.strip().splitlines() or ["no output"])[-1])
@@ -116,19 +118,25 @@ def main():
         CTX = ssl.create_default_context(cafile=CA)
     scheme = "https" if CTX else "http"
 
+    # During setup the gateway serves only this Pi (the sign-in page and session routes) and answers
+    # every other device with 403 "setup not finished"; anonymous data requests get 403 everywhere.
+    refused = (401, 403) if setup else (401,)
     addrs = ["127.0.0.1"] + sh("hostname -I").split()
     for a in addrs:
         if ":" in a:
             continue
         base = f"{scheme}://{a}:{gport}"
         c, body = code(base + "/")
-        check(f"gateway serves Archimet over {scheme.upper()} on {a}", c == 200 and b"<title>Archimet</title>" in body, c)
-        bad = [p for p in STOCK if code(base + p)[0] != 404]
-        check(f"stock Kismet paths are 404 on {a}:{gport}", not bad, bad)
+        if setup and a != "127.0.0.1":
+            check(f"setup lock: {a} gets only the 'setup not finished' page", c == 403 and b"setup not finished" in body, c)
+        else:
+            check(f"gateway serves Archimet over {scheme.upper()} on {a}", c == 200 and b"<title>Archimet</title>" in body, c)
+        bad = [p for p in STOCK if code(base + p)[0] not in ((403, 404) if setup else (404,))]
+        check(f"stock Kismet paths are not served on {a}:{gport}", not bad, bad)
         c, _ = code(base + "/archimet/state.json")
-        check(f"anonymous logger data refused on {a}", c == 401, c)
+        check(f"anonymous logger data refused on {a}", c in refused, c)
         c, _ = code(base + "/system/status.json")
-        check(f"anonymous Kismet data refused on {a}", c == 401, c)
+        check(f"anonymous Kismet data refused on {a}", c in refused, c)
         # Anonymous account change with an empty form, so it can never set anything: refused by the
         # gateway's policy (422) or lock (403), or by Kismet (401 / 403).
         c, _ = code(base + "/session/set_password", "POST")
@@ -161,6 +169,8 @@ def main():
         for r in results:
             print(f"{'PASS' if r['ok'] else 'FAIL'}  {r['check']}" + (f"  ({r['detail']})" if r["detail"] and not r["ok"] else ""))
         print(f"\n{'ALL PASS' if ok else 'FAILURES'}: {sum(r['ok'] for r in results)}/{len(results)}")
+        if setup:
+            print("Setup is not finished, so Archimet is closed to the network: that FAIL is expected until you finish it.")
     sys.exit(0 if ok else 1)
 
 

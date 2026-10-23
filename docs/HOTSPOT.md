@@ -8,10 +8,10 @@ mode, never lists it as a source and never sends test traffic on it.
 
 If the Pi already has a hotspot (for example a NetworkManager profile on `wlan0` with a watchdog
 service), Archimet does not touch it: not the profile, the radio, its address, its password, or any
-service that keeps it up. The package never runs `nmcli`. `archimet-setup detect` reports it:
+service that keeps it up. The package never runs `nmcli`. `sudo archimet-setup detect` reports it:
 
 ```
-archimet-setup detect
+sudo archimet-setup detect
 # "wlan0": {"role": "hotspot", "why": "NetworkManager access-point profile ..."}
 # "wlan1": {"role": "capture", "why": "Kismet source in kismet_site.conf"}
 ```
@@ -30,7 +30,7 @@ source nor used by another access-point profile; Archimet refuses anything else.
 ```
 sudo archimet-setup hotspot enable --iface wlan2 --ssid MyArchimet --band a --dry-run   # show what it would do
 read -rsp 'WPA2 password: ' P; echo; printf '%s\n' "$P" | sudo archimet-setup hotspot enable --iface wlan2 --ssid MyArchimet --band a; unset P
-archimet-setup hotspot status
+sudo archimet-setup hotspot status
 ```
 
 - It creates exactly one NetworkManager profile, "Archimet Hotspot"

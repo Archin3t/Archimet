@@ -143,7 +143,7 @@ const PANES = {
             intro ? h("p", { class: "dim" }, intro) : null,
             rows ? h("dl", { class: "kv" }, ...rows.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null);
         sec.append(h("div", { class: "set-title" }, h("h2", { class: "h1" }, "Data & privacy")),
-            block("What Archimet logs on the Pi", "server", "In the Archimet data folder on the Pi (ARCHIMET_OUT in /etc/default/archimet; on this Pi usually ~/kismet-logs). Readable by accounts on the Pi itself; sent over the network only to a signed-in browser.", [
+            block("What Archimet logs on the Pi", "server", "In the Archimet data folder on the Pi (ARCHIMET_OUT in /etc/default/archimet; normally /var/lib/archimet/archimet-logs). Readable on the Pi by the service account and root; sent over the network only to a signed-in browser.", [
                 ["Access points", "access_points.sqlite · MAC, network name, type, encryption, channel, manufacturer, hidden flag, first seen (date and time), last seen (date only). One row per MAC. No automatic expiry."],
                 ["Wi-Fi clients", "wifi_clients.sqlite · MAC, manufacturer, name, network names it asked for, last access point, type, first and last seen. Randomized (locally administered) MACs are not written. No automatic expiry."],
                 ["LE log", "law_enforcement.sqlite · one row per MAC with its evidence. A row leaves when you unmark it or its learned parent is withdrawn. A private JSON copy (le_history.json, mode 0640) is not served by Kismet."],

@@ -46,29 +46,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ENV = os.environ.get
-LIVE_OUT = Path("/home/kismetpi/kismet-logs")
-OUT = Path(ENV("ARCHIMET_OUT", str(LIVE_OUT)))
+OUT = Path(ENV("ARCHIMET_OUT", "/var/lib/archimet/archimet-logs"))
 # The isolated test instance's synthetic fixture (tools/pi_testenv.py). Its records are dropped
-# whenever the logger writes the real logs, so a fixture can never enter them.
+# everywhere except the test instance's own directory, so a fixture can never enter real logs
+# wherever ARCHIMET_OUT points.
+TEST_DIR_NAME = "archimet-test"
 TEST_FIXTURE_MACS = {"02:00:00:00:A0:01", "02:00:00:00:B0:02"}
 TEST_FIXTURE_SSID = "archimet-test-ap"
 
 
 def quarantined(d, out=None):
-    """True for a synthetic test-fixture record when the output is the real log directory."""
-    try:
-        live = Path(out or OUT).resolve() == LIVE_OUT.resolve()
-    except OSError:
-        live = True
+    """True for a synthetic test-fixture record unless the output is the test instance's directory."""
+    live = TEST_DIR_NAME not in Path(out or OUT).parts
     return live and (d.get("mac") in TEST_FIXTURE_MACS or TEST_FIXTURE_SSID in (d.get("ssid"), d.get("name")))
-CREDS = Path(ENV("ARCHIMET_CREDS", "/home/kismetpi/.kismet/kismet_httpd.conf"))
+CREDS = Path(ENV("ARCHIMET_CREDS", "/var/lib/archimet/.kismet/kismet_httpd.conf"))
 API = ENV("ARCHIMET_API", "http://127.0.0.1:2500")
 # Copy of law_enforcement.sqlite for the web UI's "LE History" tab (served by
 # the lehighlight Kismet plugin). Rewritten only when an LE row changes.
 # Private copy of law_enforcement.sqlite as JSON (not web-served). LE History is served to the
 # browser only by the authenticated API; Kismet serves plugin files without a login.
 LE_HISTORY = Path(ENV("ARCHIMET_LE_HISTORY", str(OUT / "le_history.json")))
-PUBLIC_HISTORY = Path("/home/kismetpi/.kismet/plugins/lehighlight/httpd/le_history.json")
+# Where the retired lehighlight plugin used to publish LE history, next to Kismet's account file.
+PUBLIC_HISTORY = CREDS.parent / "plugins" / "lehighlight" / "httpd" / "le_history.json"
 # Review re-sightings: a new session starts after SIGHT_GAP s without an observation.
 SIGHT_GAP = 1800
 SIGHT_WRITE_EVERY = 600       # extend a session's end time on disk at most this often
@@ -1999,7 +1998,11 @@ def _loop(logs, status, auth, mtime, stop):
     pending = {}       # (MAC, PHY, log role) -> newest record, written to the AP/client logs every LOG_FLUSH_SECONDS
     flushed = 0
     print(f"Logging to {OUT} every {POLL_SECONDS:g}s", flush=True)
-    if PUBLIC_HISTORY.exists():
+    try:
+        public = PUBLIC_HISTORY.exists()
+    except OSError:          # an unreadable directory is not a published file
+        public = False
+    if public:
         print(f"WARNING: {PUBLIC_HISTORY} exists and Kismet serves it without a login; "
               "LE History is served by the API now, remove the file", flush=True)
     while not (stop and stop.is_set()):

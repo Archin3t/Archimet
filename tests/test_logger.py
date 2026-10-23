@@ -1192,12 +1192,18 @@ class ReviewResolution(Base):
 class Quarantine(unittest.TestCase):
     """The isolated instance's synthetic fixture can never enter the real logs."""
 
-    def test_fixture_dropped_only_for_the_real_log_directory(self):
-        live = K.LIVE_OUT
-        self.assertTrue(K.quarantined({"mac": "02:00:00:00:A0:01"}, live))
-        self.assertTrue(K.quarantined({"mac": "AA:BB:CC:00:00:01", "ssid": "archimet-test-ap"}, live))
-        self.assertFalse(K.quarantined({"mac": "AA:BB:CC:00:00:01", "ssid": "Home"}, live))
-        self.assertFalse(K.quarantined({"mac": "02:00:00:00:A0:01"}, Path(tempfile.gettempdir()) / "archimet-test"))
+    def test_fixture_dropped_everywhere_but_the_test_instance(self):
+        for live in (Path("/var/lib/archimet/archimet-logs"), Path("/home/someone/kismet-logs"), Path("/srv/data")):
+            self.assertTrue(K.quarantined({"mac": "02:00:00:00:A0:01"}, live))
+            self.assertTrue(K.quarantined({"mac": "AA:BB:CC:00:00:01", "ssid": "archimet-test-ap"}, live))
+            self.assertFalse(K.quarantined({"mac": "AA:BB:CC:00:00:01", "ssid": "Home"}, live))
+        self.assertFalse(K.quarantined({"mac": "02:00:00:00:A0:01"}, Path(tempfile.gettempdir()) / "archimet-test" / "logs"))
+
+    def test_no_developer_home_paths_in_shipped_code(self):
+        # A fresh install runs as the 'archimet' account, which cannot read anyone's home folder.
+        for f in sorted((ROOT / "pi").iterdir()) + sorted((ROOT / "packaging").rglob("*")):
+            if f.is_file():
+                self.assertNotIn("/home/", f.read_text(encoding="utf-8", errors="replace"), f.name)
 
 
 class Helpers(unittest.TestCase):

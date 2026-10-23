@@ -10,7 +10,7 @@ not include the reference Pi's backup utility or credentials.
 sudo archimet-selftest                    # what is wrong, check by check
 systemctl status kismet archimet-logger archimet-gateway
 journalctl -u kismet -u archimet-logger -u archimet-gateway --since -1h
-archimet-hold status                      # tested vs installed Kismet versions, holds
+sudo archimet-hold status                      # tested vs installed Kismet versions, holds
 ```
 
 | Symptom | Likely cause | Action |
@@ -19,11 +19,12 @@ archimet-hold status                      # tested vs installed Kismet versions,
 | Page loads, every panel "not answering" (502) | Kismet or the logger is down | `sudo systemctl restart kismet archimet-logger` |
 | Kismet keeps restarting | a capture source fails, or the configuration is wrong | `journalctl -u kismet`; check `source=` lines in `/etc/kismet/kismet_site.conf` (never a hotspot radio) |
 | Kismet's stock interface appears | the Archimet drop-in is missing (archimet removed?) | `systemctl cat kismet` must show `--override /etc/archimet/kismet-archimet.conf`; reinstall archimet, or `sudo systemctl disable --now kismet` |
-| `archimet-compat` fails | Kismet is not the tested version | `archimet-hold status`; go back to the tested version (below) |
+| Wi-Fi source: "Could not acquire the interface lockfile" | a lock file in `/tmp` left by Kismet running as another account | Reboot (clears `/tmp`), or `sudo rm /tmp/.kismet_cap_linux_wifi_interface_lock` while Kismet is stopped |
+| `archimet-compat` fails | Kismet is not the tested version | `sudo archimet-hold status`; go back to the tested version (below) |
 | Logger: 401 from Kismet | account changed or credentials file moved | `ARCHIMET_CREDS` in `/etc/default/archimet`; the logger re-reads it each poll |
 | Capture adapter drops out | power (under-voltage), USB or driver | Check System power flags and kernel/Kismet logs; use a proper Pi supply and consider a powered USB hub for the adapter |
-| LAN/hotspot page says setup is unfinished | default account still active | From the Pi or an SSH tunnel, sign in as `archimet/archimet` and choose a new password; `archimet-account status` |
-| LAN/hotspot page is unavailable after setup | missing/expired HTTPS certificate or address mismatch | `archimet-tls status`; `sudo archimet-tls init` or `renew`; trust the public CA on the browser device |
+| LAN/hotspot page says setup is unfinished | default account still active | From the Pi or an SSH tunnel, sign in as `archimet/archimet` and choose a new password; `sudo archimet-account status` |
+| LAN/hotspot page is unavailable after setup | missing/expired HTTPS certificate or address mismatch | `sudo archimet-tls status`; `sudo archimet-tls init` or `renew`; trust the public CA on the browser device |
 
 ## Kismet was upgraded outside the policy
 
@@ -39,7 +40,7 @@ sudo archimet-selftest
 
 Use verified `.deb` assets from the matching approved release; a future release should include
 their checksums and a rollback copy. A downgrade is always deliberate: the pin never downgrades
-on its own. The [v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) prerelease attaches the exact Kismet packages and their checksums.
+on its own. The [v5.3.0-2](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-2) release attaches the exact Kismet packages and their checksums.
 
 ## Going back to the previous Archimet release
 
@@ -58,7 +59,7 @@ file, resets to the setup-only default, and restarts Kismet and the gateway:
 
 ```
 sudo archimet-account reset
-archimet-account status
+sudo archimet-account status
 ```
 
 The gateway now blocks network clients until the default password is changed. From a browser on

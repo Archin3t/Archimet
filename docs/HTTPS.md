@@ -23,12 +23,12 @@ even a stolen `ca.key` could not impersonate any public web site to a device tha
 Check it at any time:
 
 ```
-archimet-tls status          # names covered, expiry, CA fingerprint, addresses NOT covered
+sudo archimet-tls status          # names covered, expiry, CA fingerprint, addresses NOT covered
 ```
 
 ## Trust the Pi on each device (once)
 
-1. On the Pi, note the fingerprint: `archimet-tls status` prints `CA SHA-256 fingerprint: AB:CD:…`.
+1. On the Pi, note the fingerprint: `sudo archimet-tls status` prints `CA SHA-256 fingerprint: AB:CD:…`.
 2. Get `ca.crt` onto the device: open `https://<pi-address>:2501/archimet-ca.crt` (the browser warns
    once, because it does not trust the Pi yet; continue only to download this file), or copy it with
    `scp <user>@<pi>:/etc/archimet/tls/ca.crt .`
@@ -51,7 +51,7 @@ archimet-tls status          # names covered, expiry, CA fingerprint, addresses 
 sudo archimet-tls renew       # new Pi certificate for today's addresses, same CA: no device needs re-trusting
 ```
 
-Run it when `archimet-tls status` lists an address as NOT covered (new LAN, new hotspot address) and
+Run it when `sudo archimet-tls status` lists an address as NOT covered (new LAN, new hotspot address) and
 before the certificate expires (it warns 30 days ahead). `archimet-selftest` fails while the certificate
 is missing, expired or does not cover the Pi's addresses.
 
@@ -59,7 +59,7 @@ is missing, expired or does not cover the Pi's addresses.
 
 - **Pi reinstalled, CA lost**: `sudo archimet-tls init` makes a new CA; install the new `ca.crt` on every
   device and remove the old one there. To avoid that, keep `/etc/archimet/tls/` in your private,
-  encrypted off-Pi backup (`tools/offpi_backup.py` includes `/etc/archimet`) and restore it before
+  encrypted off-Pi backup ([DATA.md](DATA.md#backups) includes `/etc/archimet`) and restore it before
   `archimet-tls init`.
 - **CA key exposed**: delete `/etc/archimet/tls/`, run `sudo archimet-tls init`, re-trust the new CA, and
   remove the old CA from every device. The name constraint limits what an old key could sign.

@@ -5,8 +5,9 @@ upgrades and package removal (even purge) never delete it.
 
 ## What is stored, and where
 
-`ARCHIMET_OUT` comes from `/etc/default/archimet`: `~<account>/kismet-logs` when that directory
-already exists (the reference Pi: `/home/kismetpi/kismet-logs`), otherwise `~<account>/archimet-logs`.
+`ARCHIMET_OUT` comes from `/etc/default/archimet`. A fresh install uses the service account `archimet`
+(home `/var/lib/archimet`) and `/var/lib/archimet/archimet-logs`; an installation migrated from an older
+setup may keep that account's existing `kismet-logs` folder.
 
 | File | Contents | Written by | Kept on remove / purge |
 |---|---|---|---|
@@ -68,9 +69,17 @@ in `/usr/sbin`), `/lib/systemd/system/archimet-{logger,gateway}.service`,
 
 ## Backups
 
-`python tools/offpi_backup.py <label>` (from the workstation) writes one compressed archive **off the
-Pi** (`local/backups/`, not tracked by git): consistent SQLite copies made with SQLite's backup API,
-configuration, account files, the logs and the Kismet packages for rollback. It then restores the
-whole archive into a temporary directory and checks every file size, every database's
-`integrity_check`, every `.deb` and the key files. The archive holds the login and captured data:
-keep it private.
+On the Pi (stopping the logger and Kismet for a minute keeps the databases consistent):
+
+```sh
+OUT=$(sed -n 's/^ARCHIMET_OUT=//p' /etc/default/archimet); case $OUT in /var/lib/archimet/*) OUT= ;; esac
+B=~/archimet-backup-$(date +%Y%m%d-%H%M).tar.gz
+sudo systemctl stop archimet-logger kismet
+sudo tar -C / -czf "$B" etc/default/archimet etc/archimet etc/kismet var/lib/archimet ${OUT:+"${OUT#/}"}
+sudo systemctl start kismet archimet-logger
+sudo chown "$USER": "$B" && chmod 600 "$B" && tar -tzf "$B" >/dev/null && echo "backup OK: $B"
+```
+
+Then copy it **off the Pi** (`scp <user>@<pi>:archimet-backup-*.tar.gz .`) and delete the copy on the Pi.
+It contains `etc/archimet/tls` (the local CA key), the web login and all captured data: keep it
+private and encrypted. For a rollback also keep the release's `.deb` files.

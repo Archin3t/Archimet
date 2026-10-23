@@ -9,10 +9,10 @@ Archimet release has been tested with newer ones.
 
 | Archimet | kismet-core | kismet-capture-linux-wifi | kismet-capture-linux-bluetooth | OS / arch | Status |
 |---|---|---|---|---|---|
-| 5.3.0-1 | 2025-09-R1 | 2025-09-R1 | 2025-09-R1 | Debian 13 "trixie" / Raspberry Pi OS (trixie), **arm64**, Raspberry Pi 3B+ | isolated arm64 tests passed; fresh Pi installation and 5.3 migration **not yet tested** |
-| 5.3.0-1 | 2025-09-R1 | 2025-09-R1 | 2025-09-R1 | trixie amd64 | **not tested**; the upstream packages exist, Archimet is not built for amd64 |
-| 5.3.0-1 | — | — | — | trixie armhf (32-bit) | **unavailable**: the Kismet trixie repository publishes amd64 and arm64 only |
-| 5.3.0-1 | — | — | — | Debian 12 "bookworm" and older | **not tested**, not built |
+| 5.3.0-2 | 2025-09-R1 | 2025-09-R1 | 2025-09-R1 | Debian 13 "trixie" / Raspberry Pi OS (trixie), **arm64**, Raspberry Pi 3B+ | isolated arm64 tests passed; installed from the release on the reference Pi (see [Status](STATUS.md) for open hardware checks) |
+| 5.3.0-2 | 2025-09-R1 | 2025-09-R1 | 2025-09-R1 | trixie amd64 | **not tested**; the upstream packages exist, Archimet is not built for amd64 |
+| 5.3.0-2 | — | — | — | trixie armhf (32-bit) | **unavailable**: the Kismet trixie repository publishes amd64 and arm64 only |
+| 5.3.0-2 | — | — | — | Debian 12 "bookworm" and older | **not tested**, not built |
 
 Kismet 2025-09-R1: git tag `kismet-2025-09-R1` = commit `7a3b5d2`; the binaries report their build revision `b5d5a2d04`, the tag's parent, and the tag adds only the generated `version.c`. The SHA-256 of each tested
 upstream package, as published in the signed repository index, is in
@@ -35,7 +35,7 @@ version is never replaced by "latest": the install stops (see *What apt does*).
 
 OS security updates are unaffected: the pin and the holds name only these three packages.
 
-`archimet-hold status` shows the tested versions, what is installed, whether each is held, and a
+`sudo archimet-hold status` shows the tested versions, what is installed, whether each is held, and a
 **NOTICE** when the repository offers a newer Kismet. That notice is information only.
 
 ## What apt does
@@ -58,13 +58,12 @@ stop an administrator from doing that; `archimet-selftest` then reports the mism
 
 A new Kismet release is noted, not installed. Adopting it means a new Archimet release:
 
-1. **Back up**: `python tools/offpi_backup.py pre-kismet-<ver>` (verified and restore-tested, off the Pi).
+1. **Back up**: [DATA.md](DATA.md#backups), copied off the Pi and checked.
 2. **Stage**: `apt-get download` the new upstream packages; record their SHA-256 from the signed
    index; set `TESTED` in `packaging/build-deb.sh` and update `packaging/tested-kismet.sha256`.
-3. **Audit in isolation**: `python tools/pi_testenv.py up --package <new deb>`, then `archimet-compat`
-   (every endpoint, field, auth flow and source action Archimet uses), `tools/route_audit.py`,
-   `tools/write_tests.py` and `tools/deployed_ui_check.mjs`. A contract failure means deliberate UI
-   work, never a silent switch.
+3. **Audit in isolation**: on a separate Kismet instance, `archimet-compat` (every endpoint, field,
+   auth flow and source action Archimet uses), plus the maintainer's route, write and UI audits (not in
+   this repository). A contract failure means deliberate UI work, never a silent switch.
 4. **Test on the Pi**: back up; `sudo archimet-hold release`; install the new Kismet packages and the
    new Archimet package together; `sudo archimet-hold apply`; reboot; `sudo archimet-selftest`.
 5. **Release** the new Archimet version with its compatibility-matrix row, the attached upstream
@@ -84,7 +83,7 @@ capture helpers or a route in `pi/archimet-gateway` (`ROUTES`) as urgent.
 ## Upgrading Archimet itself
 
 ```
-python tools/offpi_backup.py pre-upgrade                 # on the workstation: verified backup, off the Pi
+# first: a backup copied off the Pi (DATA.md, Backups)
 sudo apt install ./archimet_<new>_arm64.deb              # services restart; data, account and settings stay
 sudo archimet-selftest
 ```

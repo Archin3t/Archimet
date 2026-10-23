@@ -7,7 +7,7 @@ The 5.3 package targets a **Raspberry Pi 3B+ with 64-bit Raspberry Pi OS / Debia
 For the intended Wi-Fi workflow you need:
 
 - A stable Pi power supply with enough current for the Pi **and** attached USB radios. Under-voltage can interrupt or distort capture; check the System power flags and `sudo archimet-selftest`. A powered USB hub may help a power-hungry adapter, but does not replace proper Pi input power.
-- A Linux Wi-Fi adapter and driver that support monitor mode, **separate** from the Pi's networking/hotspot radio. The reference setup uses a USB Alfa adapter as `wlan1`; that model and driver are not a guarantee for every board or kernel. Confirm actual Linux interface names with `archimet-setup detect`.
+- A Linux Wi-Fi adapter and driver that support monitor mode, **separate** from the Pi's networking/hotspot radio. The reference setup uses a USB Alfa adapter as `wlan1`; that model and driver are not a guarantee for every board or kernel. Confirm actual Linux interface names with `sudo archimet-setup detect`.
 - Storage for Raspberry Pi OS, Kismet and Archimet's selected metadata logs. Retention grows with observations; monitor free space in System and plan private off-Pi backups.
 - A browser on the Pi's local Ethernet, Wi-Fi or optional hotspot network. First account setup requires a browser on the Pi or an SSH tunnel and then local HTTPS trust for other devices.
 
@@ -15,11 +15,11 @@ A Linux Bluetooth controller is optional. [Kismet's Linux Bluetooth source](http
 
 ## Reserve the networking radio
 
-The Pi's onboard `wlan0` is reserved for networking or a hotspot and must not be a capture source. The installer does not reconfigure an existing hotspot. An optional Archimet hotspot also needs its own free radio, separate from a capture adapter. `archimet-setup detect` reports detected interface roles; `archimet-selftest` checks for a configured hotspot/capture collision. See [Hotspot](HOTSPOT.md).
+The Pi's onboard `wlan0` is reserved for networking or a hotspot and must not be a capture source. The installer does not reconfigure an existing hotspot. An optional Archimet hotspot also needs its own free radio, separate from a capture adapter. `sudo archimet-setup detect` reports detected interface roles; `archimet-selftest` checks for a configured hotspot/capture collision. See [Hotspot](HOTSPOT.md).
 
 ## Make a source actually capture
 
-Run `archimet-setup detect` to identify the interface. Add a Kismet source to `/etc/kismet/kismet_site.conf` or use Sources in the UI. For example, **only after checking the real interface names and their roles**:
+Run `sudo archimet-setup detect` to identify the interface. Add a Kismet source to `/etc/kismet/kismet_site.conf` or use Sources in the UI. For example, **only after checking the real interface names and their roles**:
 
 ```text
 source=wlan1:type=linuxwifi,name=wifi-capture
