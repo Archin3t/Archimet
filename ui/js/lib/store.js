@@ -60,8 +60,11 @@ function load() {
 
 function merge(base, over) {
     for (const [k, v] of Object.entries(over || {})) {
+        // Preferences may come from localStorage. Never traverse inherited properties or
+        // the special keys that can change an object's prototype.
+        if (k === "__proto__" || k === "constructor" || k === "prototype" || !Object.hasOwn(base, k)) continue;
         if (v && typeof v === "object" && !Array.isArray(v) && base[k] && typeof base[k] === "object") merge(base[k], v);
-        else if (k in base) base[k] = v;
+        else base[k] = v;
     }
     return base;
 }
