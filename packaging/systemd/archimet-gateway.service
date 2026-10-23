@@ -1,0 +1,35 @@
+[Unit]
+Description=Archimet gateway (the web entry point: Archimet UI + allowlisted Kismet API)
+Documentation=file:///usr/share/doc/archimet/README.md
+After=network.target kismet.service archimet-logger.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/archimet
+ExecStart=/usr/bin/python3 /usr/lib/archimet/archimet-gateway
+Restart=always
+RestartSec=3
+# The gateway holds no credentials and reads only the web root: run it as a throwaway user.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryMax=96M
+# HTTPS: the certificate made by archimet-tls. The gateway's DynamicUser cannot read /etc/archimet/tls,
+# so systemd hands the files over as credentials. SetCredential= is the fallback when they do not exist
+# yet: the gateway then starts without HTTPS and serves loopback clients only.
+LoadCredential=server.crt:/etc/archimet/tls/server.crt
+LoadCredential=server.key:/etc/archimet/tls/server.key
+SetCredential=server.crt:
+SetCredential=server.key:
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Archinet
+"""Local HTTPS for Archimet on an offline Pi: a private certificate authority and the Pi's certificate.
+
+    sudo archimet-tls init       create the CA (once) and the Pi's certificate; restart the gateway
+    sudo archimet-tls renew      new Pi certificate from the existing CA (new addresses, or before expiry)
+    archimet-tls status          names / addresses covered, expiry, CA fingerprint, addresses NOT covered
+
+Files (/etc/archimet/tls, root only except the public CA certificate):
+    ca.crt   install once on each computer / phone (public; also served at https://<pi>:2501/archimet-ca.crt)
+    ca.key   never leaves the Pi (600). Losing it only means making a new CA and re-trusting it.
+    server.crt / server.key   the Pi's certificate (397 days), given to the gateway as systemd credentials
+
+The CA is name-constrained: it can only sign localhost, *.local, this Pi's host name and private /
+loopback addresses (10/8, 172.16/12, 192.168/16, 169.254/16, 127/8). A copy of ca.key could not
+impersonate any public web site. No internet, DNS, ACME or port forwarding is involved.
+The certificate covers: localhost, <hostname>, <hostname>.local, 127.0.0.1, every current IPv4 address
+of the Pi, and the address of every NetworkManager access-point profile (read only; nothing is changed).
+"""
+import datetime
+import ipaddress
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DIR = Path(os.environ.get("ARCHIMET_TLS_DIR", "/etc/archimet/tls"))
+PRIVATE = ["10.0.0.0/255.0.0.0", "172.16.0.0/255.240.0.0", "192.168.0.0/255.255.0.0", "169.254.0.0/255.255.0.0",
+           "127.0.0.0/255.0.0.0"]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def names():
+    host = socket.gethostname().split(".")[0]
+    dns = ["localhost", host, f"{host}.local"]
+    ips = ["127.0.0.1"] + run(["hostname", "-I"]).stdout.split()
+    # Access-point profiles (the hotspot): their addresses, read only.
+    profiles = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"]).stdout.splitlines()
+    for line in profiles:
+        name, _, typ = line.rpartition(":")
+        if typ != "802-11-wireless":
+            continue
+        mode = run(["nmcli", "-g", "802-11-wireless.mode", "connection", "show", name]).stdout.strip()
+        if mode == "ap":
+            for a in run(["nmcli", "-g", "ipv4.addresses", "connection", "show", name]).stdout.replace(",", " ").split():
+                ips.append(a.split("/")[0])
+    out = []
+    for ip in ips:
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if a.version == 4 and (a.is_private or a.is_loopback or a.is_link_local) and ip not in out:
+            out.append(ip)
+    return dns, out
+
+
+def write_ca():
+    host = socket.gethostname().split(".")[0]
+    nc = [f"permitted;DNS.{i}={d}" for i, d in enumerate(["localhost", ".local", host], 1)]
+    nc += [f"permitted;IP.{i}={r}" for i, r in enumerate(PRIVATE, 1)]
+    cnf = DIR / "ca.cnf"
+    cnf.write_text("[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Archimet local CA (" + host + ")\n"
+                   "[v3_ca]\nbasicConstraints=critical,CA:true,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n"
+                   "subjectKeyIdentifier=hash\nnameConstraints=critical,@nc\n[nc]\n" + "\n".join(nc) + "\n")
+    r = run(["openssl", "req", "-x509", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-noenc",
+             "-days", "3650", "-keyout", str(DIR / "ca.key"), "-out", str(DIR / "ca.crt"), "-config", str(cnf),
+             "-extensions", "v3_ca"])
+    if r.returncode:
+        sys.exit("CA creation failed: " + r.stderr[-400:])
+    os.chmod(DIR / "ca.key", 0o600)
+    os.chmod(DIR / "ca.crt", 0o644)
+
+
+def write_server():
+    dns, ips = names()
+    san = [f"DNS.{i}={d}" for i, d in enumerate(dns, 1)] + [f"IP.{i}={a}" for i, a in enumerate(ips, 1)]
+    with tempfile.TemporaryDirectory(dir=DIR) as td:
+        t = Path(td)
+        (t / "srv.cnf").write_text("[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=" + dns[1] + "\n"
+                                   "[v3_srv]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\n"
+                                   "extendedKeyUsage=serverAuth\nsubjectAltName=@san\n[san]\n" + "\n".join(san) + "\n")
+        r = run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-noenc",
+                 "-keyout", str(t / "server.key"), "-out", str(t / "server.csr"), "-config", str(t / "srv.cnf")])
+        if r.returncode:
+            sys.exit("key creation failed: " + r.stderr[-400:])
+        # 397 days: the longest validity browsers accept for a server certificate.
+        r = run(["openssl", "x509", "-req", "-in", str(t / "server.csr"), "-CA", str(DIR / "ca.crt"), "-CAkey", str(DIR / "ca.key"),
+                 "-CAcreateserial", "-CAserial", str(DIR / "ca.srl"), "-days", "397", "-out", str(t / "server.crt"),
+                 "-extfile", str(t / "srv.cnf"), "-extensions", "v3_srv"])
+        if r.returncode:
+            sys.exit("signing failed: " + r.stderr[-400:])
+        v = run(["openssl", "verify", "-CAfile", str(DIR / "ca.crt"), str(t / "server.crt")])
+        if v.returncode:
+            sys.exit("the new certificate does not verify against the CA: " + v.stdout + v.stderr)
+        os.chmod(t / "server.key", 0o600)
+        os.chmod(t / "server.crt", 0o644)
+        os.replace(t / "server.key", DIR / "server.key")
+        os.replace(t / "server.crt", DIR / "server.crt")
+    print("certificate for:", ", ".join(dns + ips))
+
+
+def restart_gateway():
+    run(["systemctl", "try-restart", "archimet-gateway.service"])
+
+
+def fingerprint():
+    return run(["openssl", "x509", "-in", str(DIR / "ca.crt"), "-noout", "-fingerprint", "-sha256"]).stdout.strip().split("=")[-1]
+
+
+def status():
+    if not (DIR / "server.crt").is_file():
+        print("HTTPS: not configured (run: sudo archimet-tls init). The gateway is loopback-only.")
+        return 1
+    txt = run(["openssl", "x509", "-in", str(DIR / "server.crt"), "-noout", "-enddate", "-ext", "subjectAltName"]).stdout
+    end = txt.split("notAfter=")[1].splitlines()[0].strip()
+    left = (datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - datetime.datetime.utcnow()).days
+    dns, ips = names()
+    covered = txt.split("Subject Alternative Name:")[-1]
+    missing = [n for n in dns + ips if f"DNS:{n}" not in covered and f"IP Address:{n}" not in covered]
+    print(f"certificate: {DIR / 'server.crt'}\nexpires: {end} ({left} days)\ncovers:{covered.strip()}")
+    print(f"CA SHA-256 fingerprint: {fingerprint()}")
+    if missing:
+        print("NOT covered (run: sudo archimet-tls renew):", ", ".join(missing))
+    if left < 30:
+        print("Renew soon: sudo archimet-tls renew")
+    return 0 if not missing and left >= 0 else 1
+
+
+def main():
+    cmd = (sys.argv[1:] or ["status"])[0]
+    if cmd == "status":
+        sys.exit(status())
+    if os.geteuid() != 0:
+        sys.exit("run as root: sudo archimet-tls " + cmd)
+    DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DIR, 0o755)
+    if cmd == "init":
+        if not (DIR / "ca.key").is_file():
+            write_ca()
+            print("created the Archimet local CA")
+        else:
+            print("keeping the existing CA (devices that trust it keep working)")
+        if not (DIR / "server.crt").is_file():
+            write_server()
+        restart_gateway()
+    elif cmd == "renew":
+        if not (DIR / "ca.key").is_file():
+            sys.exit("no CA yet: sudo archimet-tls init")
+        write_server()
+        restart_gateway()
+    else:
+        sys.exit(__doc__)
+    print(f"CA SHA-256 fingerprint (compare on each device): {fingerprint()}")
+
+
+if __name__ == "__main__":
+    main()

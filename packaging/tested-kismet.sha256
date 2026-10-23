@@ -1,0 +1,9 @@
+# SHA-256 of the upstream Kismet packages this Archimet release is tested with, as published in the
+# signed Kismet repository index (https://www.kismetwireless.net/repos/apt/release/trixie, InRelease of
+# 2026-02-02). arm64 is the tested architecture; amd64 is listed for reference only (not tested).
+a20827c05a5716c61289dff5bfbc9b1f07c2b846c2ba55dc1a1bd539dac6ffaa  kismet-core_2025-09-R1_arm64.deb
+56761381aa94c00885740f557bf72218beeb1769639f3b69566e23fd93872fef  kismet-capture-linux-wifi_2025-09-R1_arm64.deb
+365f9cc0df4eff2f8d4204d3307f33f43a66b2c9712be58809d6eebdad44663b  kismet-capture-linux-bluetooth_2025-09-R1_arm64.deb
+a8f16df0cd9a14c1d92cb2b2abbc8ab28c54ee87ffe18751b5bddf93a12d1849  kismet-core_2025-09-R1_amd64.deb
+ea81c909fbe040eec906a4b7d8428537123e1328d02ab4e6375ef77e9532d3cd  kismet-capture-linux-wifi_2025-09-R1_amd64.deb
+5b605214b5e826817799e13509682a86c8b65d823819eaf07668bece5cd36691  kismet-capture-linux-bluetooth_2025-09-R1_amd64.deb

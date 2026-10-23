@@ -1,0 +1,23 @@
+#!/bin/sh
+# Data is never deleted here: the Archimet databases, Kismet's ~/.kismet (login, names, notes) and
+# any backups stay where they are, also on purge. Kismet itself stays installed (it is not ours).
+set -e
+case "$1" in
+remove)
+    if [ -d /run/systemd/system ]; then
+        systemctl disable archimet-gateway.service archimet-logger.service >/dev/null 2>&1 || true
+        systemctl daemon-reload || true
+        # Without Archimet's drop-in, kismet.service would serve Kismet's stock UI on the network:
+        # stop it rather than expose it. Start it again deliberately if you want stock Kismet.
+        systemctl disable --now kismet.service >/dev/null 2>&1 || true
+        echo "archimet removed: kismet.service was stopped and disabled (it would otherwise serve the stock UI on the network)."
+    fi
+    ;;
+purge)
+    rm -rf /etc/systemd/system/archimet-logger.service.d
+    rm -f /etc/systemd/system/kismet.service.d/10-archimet-user.conf /etc/default/archimet
+    [ -d /run/systemd/system ] && systemctl daemon-reload || true
+    echo "archimet purged; data directories, Kismet and Kismet's per-user files were kept."
+    ;;
+esac
+exit 0

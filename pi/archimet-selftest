@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Archimet self-test: is this Pi running Archimet as designed? Read-only. Prints PASS/FAIL per check.
+
+    sudo archimet-selftest            (sudo: to read the Kismet login for the API checks)
+    archimet-selftest --json
+
+Checks: tested Kismet versions installed and held; apt pin present; services active; Kismet and the
+logger listen on loopback only; the gateway is the only web listener; stock Kismet pages are not
+reachable on any address; the gateway serves Archimet; every API route Archimet uses answers
+(archimet-compat); anonymous access and anonymous account changes are refused; setup is finished (no default
+password); HTTPS is active and plain HTTP gets no data; no capture source uses a hotspot radio.
+"""
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULTS = "/etc/default/archimet"
+TESTED = "/usr/share/archimet/tested-kismet.txt"
+STOCK = ["/js/kismet.ui.js", "/js/kismet.ui.base.js", "/css/kismet.css", "/images/kismet_logo.png", "/dynamic.js",
+         "/plugin/lehighlight/js/lehighlight.js", "/pcap/all_packets.pcapng", "/logging/active.json"]
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append({"check": name, "ok": bool(ok), "detail": str(detail)})
+
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+
+
+def env():
+    e = {}
+    if os.path.exists(DEFAULTS):
+        for l in open(DEFAULTS):
+            m = re.match(r"^([A-Z_]+)=(.*)$", l.strip())
+            if m:
+                e[m.group(1)] = m.group(2)
+    return e
+
+
+CA = "/etc/archimet/tls/ca.crt"
+CTX = None
+
+
+def code(url, method="GET"):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=6,
+                                    context=CTX if url.startswith("https:") else None) as r:
+            return r.status, r.read(400)
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, b""
+    except (urllib.error.URLError, OSError):
+        return 0, b""
+
+
+def listeners():
+    """{port: [addresses]} from ss."""
+    out = {}
+    for line in sh("ss -ltnH").splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            addr, _, port = parts[3].rpartition(":")
+            out.setdefault(int(port), []).append(addr.strip("[]"))
+    return out
+
+
+def main():
+    e = env()
+    gw = e.get("ARCHIMET_GATEWAY_BIND", "0.0.0.0:2501")
+    gport = int(gw.rpartition(":")[2])
+    kport = int(e.get("ARCHIMET_KISMET_URL", "http://127.0.0.1:2500").rpartition(":")[2].strip("/"))
+    lport = int(e.get("ARCHIMET_LOGGER_URL", "http://127.0.0.1:2502").rpartition(":")[2].strip("/"))
+
+    for line in open(TESTED) if os.path.exists(TESTED) else []:
+        if line.strip():
+            pkg, ver = line.split()
+            have = sh(f"dpkg-query -W -f='${{Version}}' {pkg} 2>/dev/null")
+            check(f"{pkg} is the tested version {ver}", have == ver, have or "not installed")
+            check(f"{pkg} is held", pkg in sh("apt-mark showhold").split(), "apt-mark showhold")
+    check("apt pin /etc/apt/preferences.d/archimet-kismet", os.path.exists("/etc/apt/preferences.d/archimet-kismet"))
+    # kismet-core Recommends a dozen capture helpers and tools; installed with apt's defaults they come
+    # along untested, unpinned and unheld. Archimet needs only the tested ones.
+    tested = {l.split()[0] for l in (open(TESTED) if os.path.exists(TESTED) else []) if l.strip()}
+    installed = [l.split()[1] for l in sh("dpkg-query -W -f='${db:Status-Abbrev} ${Package}\\n' 'kismet*' 2>/dev/null").splitlines()
+                 if l.startswith("ii") and len(l.split()) == 2]
+    extra = sorted(set(installed) - tested)
+    check("no untested Kismet packages installed", not extra,
+          f"{' '.join(extra)}; remove with: sudo apt-get purge {' '.join(extra)}" if extra else "")
+    for s in ("kismet", "archimet-logger", "archimet-gateway"):
+        check(f"service {s} active", sh(f"systemctl is-active {s}") == "active", sh(f"systemctl is-enabled {s}"))
+
+    ls = listeners()
+    loop = lambda addrs: addrs and all(a in ("127.0.0.1", "::1") for a in addrs)
+    check(f"Kismet listens on loopback only (:{kport})", loop(ls.get(kport, [])), ls.get(kport, "not listening"))
+    check(f"logger listens on loopback only (:{lport})", loop(ls.get(lport, [])), ls.get(lport, "not listening"))
+    check(f"gateway listens on :{gport}", gport in ls, ls.get(gport, "not listening"))
+    web = [p for p in ls if p not in (22, gport, kport, lport) and p < 10000 and any(a not in ("127.0.0.1", "::1") for a in ls[p])]
+    check("no other network listener", not web, web)
+
+    # Setup and HTTPS (the gateway serves other devices only when both are done).
+    acct = subprocess.run(["python3", "/usr/lib/archimet/archimet-account", "status"], capture_output=True, text=True)
+    check("setup finished: the default password is not active", acct.returncode == 0, acct.stdout.strip())
+    tls = subprocess.run(["python3", "/usr/lib/archimet/archimet-tls", "status"], capture_output=True, text=True)
+    check("HTTPS certificate present, valid and covering this Pi's addresses", tls.returncode == 0,
+          (tls.stdout.strip().splitlines() or ["no output"])[-1])
+    global CTX
+    if os.path.exists(CA):
+        CTX = ssl.create_default_context(cafile=CA)
+    scheme = "https" if CTX else "http"
+
+    addrs = ["127.0.0.1"] + sh("hostname -I").split()
+    for a in addrs:
+        if ":" in a:
+            continue
+        base = f"{scheme}://{a}:{gport}"
+        c, body = code(base + "/")
+        check(f"gateway serves Archimet over {scheme.upper()} on {a}", c == 200 and b"<title>Archimet</title>" in body, c)
+        bad = [p for p in STOCK if code(base + p)[0] != 404]
+        check(f"stock Kismet paths are 404 on {a}:{gport}", not bad, bad)
+        c, _ = code(base + "/archimet/state.json")
+        check(f"anonymous logger data refused on {a}", c == 401, c)
+        c, _ = code(base + "/system/status.json")
+        check(f"anonymous Kismet data refused on {a}", c == 401, c)
+        # Anonymous account change with an empty form, so it can never set anything: refused by the
+        # gateway's policy (422) or lock (403), or by Kismet (401 / 403).
+        c, _ = code(base + "/session/set_password", "POST")
+        check(f"anonymous set_password refused on {a}", c in (400, 401, 403, 422), c)
+        if a != "127.0.0.1":
+            c, _ = code(f"http://{a}:{gport}/")
+            check(f"plain HTTP on {a}:{gport} redirects to HTTPS (no data over HTTP)", c in (301, 0) if CTX else c == 403, c)
+            for p in (kport, lport):
+                check(f"port {p} not reachable from {a}", code(f"http://{a}:{p}/")[0] == 0)
+
+    r = subprocess.run(["python3", "/usr/lib/archimet/archimet-compat"], capture_output=True, text=True,
+                       env={**os.environ, "ARCHIMET_API": f"http://127.0.0.1:{kport}", "ARCHIMET_LOGGER_URL": f"http://127.0.0.1:{lport}",
+                            "ARCHIMET_CREDS": e.get("ARCHIMET_CREDS", "")})
+    check("API compatibility (archimet-compat)", r.returncode == 0, (r.stdout.strip().splitlines() or [r.stderr.strip()])[-1])
+
+    site = open("/etc/kismet/kismet_site.conf").read() if os.path.exists("/etc/kismet/kismet_site.conf") else ""
+    srcs = re.findall(r"^\s*source\s*=\s*([^:\s]+)", site, re.M)
+    try:
+        det = json.loads(sh("python3 /usr/lib/archimet/archimet-setup detect"))
+        hotspot = [i for i, v in det["radios"].items() if v["role"] == "hotspot"]
+    except (ValueError, KeyError):
+        hotspot = []
+    check("no capture source on a hotspot radio (wlan0 always reserved)", not (set(srcs) & set(hotspot + ["wlan0"])),
+          {"sources": srcs, "hotspot_radios": hotspot})
+
+    ok = all(r["ok"] for r in results)
+    if "--json" in sys.argv:
+        print(json.dumps({"ok": ok, "results": results}, indent=1))
+    else:
+        for r in results:
+            print(f"{'PASS' if r['ok'] else 'FAIL'}  {r['check']}" + (f"  ({r['detail']})" if r["detail"] and not r["ok"] else ""))
+        print(f"\n{'ALL PASS' if ok else 'FAILURES'}: {sum(r['ok'] for r in results)}/{len(results)}")
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

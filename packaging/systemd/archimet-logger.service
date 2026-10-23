@@ -1,0 +1,20 @@
+[Unit]
+Description=Archimet logger (AP / client / LE logs, Review, Archive, authenticated Archimet API)
+Documentation=file:///usr/share/doc/archimet/README.md
+After=kismet.service
+Wants=kismet.service
+
+[Service]
+Type=simple
+# User/Group: /etc/systemd/system/archimet-logger.service.d/10-user.conf (from /etc/default/archimet).
+EnvironmentFile=/etc/default/archimet
+ExecStart=/usr/bin/python3 /usr/lib/archimet/kismet-device-logger
+Restart=always
+RestartSec=15
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2223 @@
+#!/usr/bin/python3
+"""Poll Kismet's local API and keep three de-duplicated device logs.
+
+  access_points.sqlite    Wi-Fi APs / ad-hoc / WDS (anything broadcasting a network)
+  wifi_clients.sqlite     Wi-Fi client devices (phones, laptops, IoT, probing or connected)
+  law_enforcement.sqlite  Body cams, in-car routers and other LE gear (Wi-Fi + Bluetooth)
+
+One row per MAC. first_seen is the earliest observation; last_seen is a date
+and only changes when the day changes, so a device seen all day costs one write.
+
+Archimet additions (schemas of the three files above are unchanged):
+
+  - Classification comes from one rules file (/usr/local/share/archimet/le_rules.json),
+    shared with the Kismet plugin. match_reason starts with
+      "Hardware: "  a device-class MAC block (see the rules file),
+      "Operator: "  an operator's "Mark as LE" (note, time and source kept),
+      "Learned: "   a Kismet association record linking the device to a
+                    confirmed (Hardware/Operator) LE device. One hop only.
+  - Anything weaker (fleet vendor, model or agency name, probes, adjacent MAC)
+    goes to Review in archimet_review.sqlite, never to the LE log.
+  - A small authenticated HTTP API on :2502 serves state to the plugin and
+    accepts "Mark as LE" / "Unmark". It checks the caller's Kismet login.
+  - Polls every 5 s with a slim field list; nothing is written when nothing changed.
+
+  --import-inventory PATH   one-time import of the old ChatGPT inventory.db
+  --migrate                 move keyword-only LE rows to Review (run once, with a backup)
+  --rollback-migration      undo --migrate from its own log
+"""
+import argparse
+import base64
+import collections
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ENV = os.environ.get
+LIVE_OUT = Path("/home/kismetpi/kismet-logs")
+OUT = Path(ENV("ARCHIMET_OUT", str(LIVE_OUT)))
+# The isolated test instance's synthetic fixture (tools/pi_testenv.py). Its records are dropped
+# whenever the logger writes the real logs, so a fixture can never enter them.
+TEST_FIXTURE_MACS = {"02:00:00:00:A0:01", "02:00:00:00:B0:02"}
+TEST_FIXTURE_SSID = "archimet-test-ap"
+
+
+def quarantined(d, out=None):
+    """True for a synthetic test-fixture record when the output is the real log directory."""
+    try:
+        live = Path(out or OUT).resolve() == LIVE_OUT.resolve()
+    except OSError:
+        live = True
+    return live and (d.get("mac") in TEST_FIXTURE_MACS or TEST_FIXTURE_SSID in (d.get("ssid"), d.get("name")))
+CREDS = Path(ENV("ARCHIMET_CREDS", "/home/kismetpi/.kismet/kismet_httpd.conf"))
+API = ENV("ARCHIMET_API", "http://127.0.0.1:2500")
+# Copy of law_enforcement.sqlite for the web UI's "LE History" tab (served by
+# the lehighlight Kismet plugin). Rewritten only when an LE row changes.
+# Private copy of law_enforcement.sqlite as JSON (not web-served). LE History is served to the
+# browser only by the authenticated API; Kismet serves plugin files without a login.
+LE_HISTORY = Path(ENV("ARCHIMET_LE_HISTORY", str(OUT / "le_history.json")))
+PUBLIC_HISTORY = Path("/home/kismetpi/.kismet/plugins/lehighlight/httpd/le_history.json")
+# Review re-sightings: a new session starts after SIGHT_GAP s without an observation.
+SIGHT_GAP = 1800
+SIGHT_WRITE_EVERY = 600       # extend a session's end time on disk at most this often
+SIGHT_KEEP = 20               # sessions kept per MAC
+NOTIFY_EVERY = 6 * 3600       # at most one re-sighting notice per unwatched MAC per 6 h
+RULES_PATH = Path(ENV("ARCHIMET_RULES", "/usr/local/share/archimet/le_rules.json"))
+REVIEW_DB = "archimet_review.sqlite"
+POLL_SECONDS = float(ENV("ARCHIMET_POLL", "5"))
+OVERLAP = 10          # seconds re-read each poll so nothing slips between polls
+# The AP / client logs keep the original 120 s write cadence: dual-band APs and
+# roaming clients flip channel / BSSID constantly, and writing every flip at the
+# 5 s poll rate cost ~1.2 MB/90 s of SD writes. LE / Review are written at once.
+LOG_FLUSH_SECONDS = float(ENV("ARCHIMET_LOG_FLUSH", "120"))
+HTTP_BIND = ENV("ARCHIMET_HTTP", "0.0.0.0:2502")   # "off" disables the API
+VERSION = "archimet-logger 5.3.0"
+
+FIELDS = [
+    "kismet.device.base.key",
+    "kismet.device.base.macaddr",
+    "kismet.device.base.type",
+    "kismet.device.base.phyname",
+    "kismet.device.base.commonname",
+    "kismet.device.base.name",
+    "kismet.device.base.manuf",
+    "kismet.device.base.crypt",
+    "kismet.device.base.channel",
+    "kismet.device.base.first_time",
+    "kismet.device.base.last_time",
+    "dot11.device/dot11.device.last_bssid",
+    "dot11.device/dot11.device.last_beaconed_ssid_record/dot11.advertisedssid.ssid",
+    "dot11.device/dot11.device.advertised_ssid_map",
+    "dot11.device/dot11.device.probed_ssid_map",
+    "dot11.device/dot11.device.client_map",
+    "dot11.device/dot11.device.associated_client_map",
+    "bluetooth.device/bluetooth.device.service_uuid_vec",
+]
+
+AP_TYPES = {"Wi-Fi AP", "Wi-Fi WDS AP", "Wi-Fi Ad-Hoc", "Wi-Fi WDS"}
+CLIENT_TYPES = {"Wi-Fi Client", "Wi-Fi Bridged", "Wi-Fi Device"}
+NULL_MACS = {"", "00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+STRENGTH = {"hardware": 3, "operator": 2, "learned": 1, "keyword": 0, "": 0}
+
+SCHEMA = {
+    "access_points.sqlite": """
+      CREATE TABLE IF NOT EXISTS access_points (
+        mac TEXT PRIMARY KEY,
+        ssid TEXT,
+        type TEXT,
+        encryption TEXT,
+        channel TEXT,
+        manufacturer TEXT,
+        hidden INTEGER,
+        first_seen TEXT,
+        last_seen TEXT
+      )""",
+    "wifi_clients.sqlite": """
+      CREATE TABLE IF NOT EXISTS wifi_clients (
+        mac TEXT PRIMARY KEY,
+        manufacturer TEXT,
+        name TEXT,
+        randomized_mac INTEGER,
+        probed_ssids TEXT,
+        connected_ap TEXT,
+        type TEXT,
+        first_seen TEXT,
+        last_seen TEXT
+      )""",
+    "law_enforcement.sqlite": """
+      CREATE TABLE IF NOT EXISTS law_enforcement (
+        mac TEXT PRIMARY KEY,
+        category TEXT,
+        radio TEXT,
+        type TEXT,
+        name TEXT,
+        manufacturer TEXT,
+        match_reason TEXT,
+        encryption TEXT,
+        first_seen TEXT,
+        last_seen TEXT
+      )""",
+}
+
+# Archimet's own store. Separate file; the three logs above keep their schemas.
+REVIEW_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS rv.review (
+        mac TEXT PRIMARY KEY, radio TEXT, type TEXT, name TEXT, manufacturer TEXT,
+        signals TEXT, why_might_be TEXT, why_might_not TEXT,
+        status TEXT, source TEXT, first_seen TEXT, last_seen TEXT, updated TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rv.overrides (
+        mac TEXT PRIMARY KEY, note TEXT, actor TEXT, source_ip TEXT, created TEXT,
+        name TEXT, manufacturer TEXT, radio TEXT, type TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rv.audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, actor TEXT, action TEXT,
+        mac TEXT, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rv.migration (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, run TEXT, mac TEXT,
+        action TEXT, before_json TEXT, after_json TEXT, reverted TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rv.sightings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, start_at TEXT, end_at TEXT,
+        polls INTEGER, detail TEXT)""",
+    "CREATE INDEX IF NOT EXISTS rv.sightings_mac ON sightings (mac, id)",
+    # Minute-precision last observation for LE and Review MACs, from Kismet's own last_time.
+    # Rows exist only for real observations made since logger 5.2; older rows stay date-only.
+    """CREATE TABLE IF NOT EXISTS rv.observed (
+        mac TEXT PRIMARY KEY, last_epoch INTEGER NOT NULL, updated TEXT)""",
+    # Review resolution (logger 5.2): the current decision per open Review MAC, and every change.
+    # Review rows themselves are never rewritten or duplicated by it.
+    """CREATE TABLE IF NOT EXISTS rv.resolution (
+        mac TEXT PRIMARY KEY, state TEXT NOT NULL, policy TEXT, rule TEXT, observed TEXT,
+        why TEXT, unknown TEXT, basis TEXT, decided_at TEXT, decided_by TEXT,
+        locked INTEGER NOT NULL DEFAULT 0, note TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rv.resolution_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, mac TEXT, from_state TEXT, to_state TEXT,
+        policy TEXT, rule TEXT, by TEXT, why TEXT, basis TEXT)""",
+]
+OBSERVE_FUTURE_SLACK = 120    # s: a Kismet time further in the future than this is a clock anomaly, not stored
+
+# ---- Review resolution policy. Versioned: every decision records the version that made it.
+# States: active (needs a person), deprioritized (kept, lower in the list, no notices), dismissed
+# (out of the Review list, no notices, reopened automatically by new evidence).
+# Never automatic: promotion to LE (only the vendor-ID rules and an operator do that), and any
+# row an operator watches, unmarked, or decided on (locked).
+REVIEW_POLICY = "review-policy 1"
+REVIEW_WEAK = {"agency", "legacy-le-row", "probe-confirmed-ssid", "probed-by-confirmed", "adjacent-mac",
+               "shared-ap", "parent-full"}            # can never confirm LE on their own
+REVIEW_DISMISSIBLE = {"agency", "legacy-le-row"}       # a typed word (and its old keyword row), nothing else
+REVIEW_OPERATOR = {"operator-unmarked"}
+REVIEW_STALE_DAYS = 30
+REVIEW_RESOLVE_SECONDS = 60
+
+
+def review_decision(rules, row, last_obs, now):
+    """Decision for one open Review row, or None when it is operator territory (watched or unmarked).
+    row: the rv.review row (signals as a list); last_obs: newest real observation (epoch) or 0.
+    -> (state, rule, observed, why, unknown, basis)"""
+    sigs = row.get("signals") or []
+    kinds = sorted({s.get("kind") or s.get("class") or "?" for s in sigs})
+    if any(s.get("watch") for s in sigs) or set(kinds) & REVIEW_OPERATOR:
+        return None
+    basis = json.dumps({"kinds": kinds}, sort_keys=True)
+    name, manuf = row.get("name") or "", row.get("manufacturer") or ""
+    words = sorted({s.get("word") for s in sigs if s.get("class") == "agency" and s.get("word")})
+    consumer = rules.consumer_radio(manuf)
+    days = int((now - last_obs) // 86400) if last_obs else None
+    weak = bool(kinds) and set(kinds) <= REVIEW_WEAK
+    # Dismissal needs evidence that contradicts the signals, not merely weak signals: a public /
+    # ISP hotspot name is shared by many users and cannot identify one agency's equipment.
+    if weak and name.strip().lower() in rules.public:
+        return ("dismissed", "public-hotspot",
+                f"Network name “{name}” is a public / ISP hotspot name (rules: public_ssids); signals: {', '.join(kinds)}.",
+                "A public hotspot is used by many people and devices, so a confirmed LE device joining it, or a word near "
+                "it, says nothing about who runs it.",
+                "Nothing further is needed. A vendor MAC prefix or a model name on this device would reopen it.", basis)
+    # A typed agency word on a consumer maker's radio: weak, but ownership is NOT disproved (an agency
+    # can run a consumer router), so it is only de-prioritised. Equipment type and LE ownership are
+    # separate questions.
+    if kinds and set(kinds) <= REVIEW_DISMISSIBLE and consumer:
+        return ("deprioritized", "consumer-radio-agency-word",
+                f"Agency word {', '.join('“%s”' % w for w in words) or '(old keyword row)'} in the network name “{name}”; "
+                f"Kismet's manufacturer lookup gives “{manuf}”, a consumer radio maker.",
+                "The only positive signal is a word anyone can type into a network name, on consumer hardware. That is "
+                "not evidence of LE equipment, but it does not prove the network is unrelated to an agency either.",
+                "Who runs this network. A fleet or LE vendor MAC prefix, an LE model name, or a data-frame link to a "
+                "confirmed LE device would make it active again.", basis)
+    if weak:
+        return ("deprioritized", "weak-only",
+                "Signals: " + ", ".join(kinds) + (f" (word {', '.join(words)})" if words else "") + (f"; manufacturer “{manuf}”" if manuf else ""),
+                "Only signals that can never confirm LE on their own (a typed word, a probe, an adjacent MAC, a shared AP).",
+                "Whether it is LE equipment at all. A vendor MAC prefix, a model name or a data-frame link to confirmed LE "
+                "would make it active again.", basis)
+    if days is not None and days > REVIEW_STALE_DAYS:
+        return ("deprioritized", "stale",
+                f"Signals: {', '.join(kinds)}; last observed {days} days ago.",
+                f"Not observed for more than {REVIEW_STALE_DAYS} days. It becomes active again when it is heard again.",
+                "Whether it is still in use.", basis)
+    return ("active", "needs-review", "Signals: " + ", ".join(kinds or ["none"]),
+            "At least one signal needs a person to judge it (fleet vendor MAC, model name, unconfirmed link).",
+            "Whether it is LE equipment.", basis)
+
+
+def ts(epoch):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch or time.time()))
+
+
+def day(epoch):
+    return time.strftime("%Y-%m-%d", time.localtime(epoch or time.time()))
+
+
+def randomized(mac):
+    try:
+        return int(int(mac.split(":")[0], 16) & 0x02 != 0)
+    except (ValueError, IndexError):
+        return 0
+
+
+def merge_list(old, new):
+    items = [x for x in (old or "").split(", ") if x]
+    for x in new:
+        if x and x not in items:
+            items.append(x)
+    return ", ".join(items)
+
+
+def norm_mac(s):
+    """'02-00-00-ab-cd-ef', '020000ABCDEF', '02:00:00:ab:cd:ef' -> '02:00:00:AB:CD:EF'."""
+    h = re.sub(r"[^0-9A-Fa-f]", "", str(s or "")).upper()
+    if len(h) != 12:
+        return ""
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def hexmac(mac):
+    return re.sub(r"[^0-9A-F]", "", (mac or "").upper())
+
+
+def radio_of(phy):
+    p = (phy or "").lower()
+    return "Bluetooth" if "bluetooth" in p or "btle" in p else "Wi-Fi"
+
+
+def kind_of(reason):
+    """Which evidence produced an LE row. Pre-Archimet rows are recognised too."""
+    r = (reason or "").strip()
+    if r.startswith("Hardware:"):
+        return "hardware"
+    if r.startswith("Operator:"):
+        return "operator"
+    if r.startswith("Learned:"):
+        return "learned"
+    parts = [p.strip().split(":", 1)[0] for p in r.split(";") if p.strip()]
+    if any(p in ("mac prefix", "manufacturer", "ble service") for p in parts):
+        return "hardware"
+    return "keyword" if parts else ""
+
+
+PARENT_RE = re.compile(r"confirmed LE (?:AP|device) ([0-9A-F]{2}(?::[0-9A-F]{2}){5})")
+
+
+def parent_of(reason):
+    m = PARENT_RE.search(reason or "")
+    return m.group(1) if m else ""
+
+
+def _values(v):
+    if isinstance(v, dict):
+        return list(v.values())
+    return v if isinstance(v, list) else []
+
+
+def parse(dev):
+    """Flatten a Kismet device record (full or slim field list) into the fields we keep."""
+    g = lambda k, d="": dev.get("kismet.device.base." + k, d) or d
+    dot11 = dev.get("dot11.device") or {}
+    if not isinstance(dot11, dict):
+        dot11 = {}
+    dg = lambda k: dot11.get(k) if dot11.get(k) is not None else dev.get(k)
+    mac = g("macaddr").upper()
+    name = g("commonname") or g("name")
+    if name.upper() == mac:
+        name = ""
+    beacon = dg("dot11.device.last_beaconed_ssid_record") or {}
+    ssid = beacon.get("dot11.advertisedssid.ssid", "") if isinstance(beacon, dict) else ""
+    ssid = ssid or dev.get("dot11.advertisedssid.ssid") or ""
+    if not ssid:
+        for rec in _values(dg("dot11.device.advertised_ssid_map")):
+            if isinstance(rec, dict) and rec.get("dot11.advertisedssid.ssid"):
+                ssid = rec["dot11.advertisedssid.ssid"]
+                break
+    probe_recs = [p for p in _values(dg("dot11.device.probed_ssid_map")) if isinstance(p, dict)]
+    probed = sorted({p.get("dot11.probedssid.ssid", "") for p in probe_recs} - {""})
+    probe_bssids = sorted({(p.get("dot11.probedssid.bssid") or "").upper() for p in probe_recs} - NULL_MACS)
+    bssid = (dg("dot11.device.last_bssid") or "").upper()
+    if bssid in NULL_MACS or bssid == mac:
+        bssid = ""
+    # Kismet's association records: per BSSID, with first/last frame time.
+    # Kismet's per-BSSID client records. Management frames (incl. directed probes and
+    # auth/assoc *requests*) create them too; the retry/fragment/DHCP/EAP/CDP/IP fields
+    # are only filled by data frames, which need a completed association.
+    assoc_to = {}
+    for b, rec in (dg("dot11.device.client_map") or {}).items():
+        b = (b or "").upper()
+        if b in NULL_MACS or b == mac or not isinstance(rec, dict):
+            continue
+        assoc_to[b] = assoc_record(rec)
+    assoc_clients = sorted({(k or "").upper() for k in (dg("dot11.device.associated_client_map") or {})}
+                           - NULL_MACS - {mac})
+    bt = dev.get("bluetooth.device") or {}
+    uuids = (bt.get("bluetooth.device.service_uuid_vec") if isinstance(bt, dict) else None) \
+        or dev.get("bluetooth.device.service_uuid_vec") or []
+    return {
+        "mac": mac,
+        "key": str(dev.get("kismet.device.base.key") or ""),
+        "type": g("type"),
+        "phy": g("phyname"),
+        "name": name,
+        "ssid": ssid,
+        "manuf": g("manuf"),
+        "crypt": g("crypt"),
+        "channel": str(g("channel")),
+        "first": g("first_time", 0),
+        "last": g("last_time", 0),
+        "probed": probed,
+        "bssid": bssid,
+        "assoc_to": assoc_to,
+        "assoc_clients": assoc_clients,
+        "probe_bssids": probe_bssids,
+        "uuids": [str(u).upper() for u in uuids],
+    }
+
+
+DATA_ONLY_FIELDS = ("dot11.client.dhcp_host", "dot11.client.dhcp_vendor", "dot11.client.eap_identity",
+                    "dot11.client.cdp_device", "dot11.client.cdp_port", "dot11.client.ipdata")
+
+
+def assoc_record(rec):
+    """One Kismet client record, with the data-frame evidence it carries (if any)."""
+    retries = int(rec.get("dot11.client.num_retries") or 0)
+    frags = int(rec.get("dot11.client.num_fragments") or 0)
+    rbytes = int(rec.get("dot11.client.datasize_retry") or 0)
+    extra = [k.split(".")[-1] for k in DATA_ONLY_FIELDS if rec.get(k) not in (None, "", 0, {}, [])]
+    ev = []
+    if retries:
+        ev.append(f"{retries} retried data frames")
+    if frags:
+        ev.append(f"{frags} fragmented data frames")
+    if rbytes and not retries:
+        ev.append(f"{rbytes} retried data bytes")
+    if extra:
+        ev.append("data-frame metadata " + "/".join(extra))
+    return {"first": rec.get("dot11.client.first_time") or 0, "last": rec.get("dot11.client.last_time") or 0,
+            "data": bool(ev), "evidence": ", ".join(ev)}
+
+
+def role_rank(d):
+    """Which of several Kismet records for one MAC defines its role: AP, then Wi-Fi client, then
+    other 802.11, then Bluetooth, then anything else. Lower is stronger."""
+    if d["phy"] == "IEEE802.11":
+        return 0 if d["type"] in AP_TYPES else 1 if d["type"] in CLIENT_TYPES else 2
+    return 3 if radio_of(d["phy"]) == "Bluetooth" else 4
+
+
+def merge_by_mac(records):
+    """Kismet keys devices by phy + MAC, so one MAC can come back as several records (e.g. a
+    Wi-Fi AP and a Bluetooth advertiser). Returns one record per MAC for classification: the role
+    of the strongest record (role_rank), the newest last_time and earliest first_time of all of
+    them, and the union of their probe / association / UUID evidence. Nothing is invented."""
+    groups = {}
+    for d in records:
+        if d["mac"]:
+            groups.setdefault(d["mac"], []).append(d)
+    out = []
+    for mac, recs in groups.items():
+        if len(recs) == 1:
+            out.append(recs[0])
+            continue
+        recs = sorted(recs, key=lambda r: (role_rank(r), -(r["last"] or 0)))
+        m = dict(recs[0])
+        m["last"] = max(r["last"] or 0 for r in recs)
+        firsts = [r["first"] for r in recs if r["first"]]
+        m["first"] = min(firsts) if firsts else 0
+        for k in ("ssid", "name", "manuf", "crypt", "bssid"):
+            m[k] = m[k] or next((r[k] for r in recs if r[k]), "")
+        for k in ("probed", "assoc_clients", "probe_bssids", "uuids"):
+            m[k] = sorted({x for r in recs for x in r[k]})
+        m["assoc_to"] = {}
+        for r in reversed(recs):          # the strongest record's entry wins a tie
+            m["assoc_to"].update(r["assoc_to"])
+        m["records"] = [f'{r["phy"]}/{r["type"]}' for r in recs]
+        out.append(m)
+    return out
+
+
+def kept_role(old, d):
+    """(radio, type) for an LE / Review row. A poll may return only a weaker record for a MAC
+    (e.g. its Bluetooth side while the Wi-Fi AP record is idle): the stronger role already
+    logged is kept."""
+    radio, dtype = radio_of(d.get("phy")), d.get("type") or ""
+    if old and old.get("type"):
+        was = {"phy": "IEEE802.11" if old.get("radio") == "Wi-Fi" else old.get("radio") or "", "type": old["type"]}
+        if role_rank(was) < role_rank({"phy": d.get("phy") or "", "type": dtype}):
+            return old.get("radio") or radio, old["type"]
+    return radio, dtype
+
+
+def log_role(d):
+    """Which AP/client log a record belongs in: "ap", "client", or None (not logged there:
+    other PHYs, other 802.11 types, randomized client MACs)."""
+    if d.get("phy") != "IEEE802.11" or not d.get("mac"):
+        return None
+    if d.get("type") in AP_TYPES:
+        return "ap"
+    if d.get("type") in CLIENT_TYPES and not randomized(d["mac"]):
+        return "client"
+    return None
+
+
+def pending_key(d):
+    """Key for the AP/client write buffer, or None if log_device would write nothing for it.
+    (MAC, PHY, log role): not Kismet's device key, which is per phy + MAC and does not change
+    when Kismet re-types a device, so an AP reading and a later client reading of one MAC
+    would share a slot and one log would lose its row; and a missing or reused key must
+    never let one MAC's reading replace another's."""
+    role = log_role(d)
+    return (d["mac"], d["phy"], role) if role else None
+
+
+def keep_newer(buf, d):
+    """Buffer a record unless the buffer already holds a newer reading of the same record."""
+    k = pending_key(d)
+    if k is None:
+        return
+    old = buf.get(k)
+    if old is None or (d["last"] or 0) >= (old["last"] or 0):
+        buf[k] = d
+
+
+def flush_pending(logs, buf):
+    """Write every buffered record to the AP/client logs. The caller commits and clears."""
+    return sum(logs.log_device(d) for d in buf.values())
+
+
+# --------------------------------------------------------------------------
+# Rules
+
+class Rules:
+    """Compiled view of le_rules.json. An empty Rules() classifies nothing."""
+
+    def __init__(self, raw=None, sha=""):
+        raw = raw or {}
+        self.raw = raw
+        self.sha = sha
+        self.version = str(raw.get("version") or "none")
+        self.categories = raw.get("categories") or {}
+        self.prefix = {}      # hex prefix -> (rule, "AA:BB:CC")
+        self.manuf = []       # (needle, rule)
+        self.names = []       # (regex, rule)
+        self.uuids = {}
+        for r in raw.get("rules") or []:
+            if r.get("class") not in ("device", "fleet", "laa", "name"):
+                raise ValueError(f"rule {r.get('id')}: unknown class {r.get('class')}")
+            if r.get("category") not in self.categories:
+                raise ValueError(f"rule {r.get('id')}: unknown category {r.get('category')}")
+            if not r.get("source"):
+                raise ValueError(f"rule {r.get('id')}: no source")
+            for p in r.get("prefixes") or []:
+                h = hexmac(p)
+                if len(h) not in (6, 7, 9) or h in self.prefix:
+                    raise ValueError(f"rule {r.get('id')}: bad or duplicate prefix {p}")
+                self.prefix[h] = (r, p.upper())
+            for m in r.get("manuf") or []:
+                self.manuf.append((m.lower(), r))
+            if r.get("pattern"):
+                self.names.append((re.compile(r["pattern"], re.I), r))
+            for u in r.get("uuids") or []:
+                self.uuids[u.upper()] = r
+        self.prefix_lens = sorted({len(h) for h in self.prefix}, reverse=True)
+        self.agency = re.compile((raw.get("agency_words") or {}).get("pattern") or "(?!x)x", re.I)
+        self.consumer = [c.lower() for c in raw.get("consumer_radios") or []]
+        self.public = {s.lower() for s in raw.get("public_ssids") or []}
+        learn = raw.get("learning") or {}
+        self.max_clients = int(learn.get("max_clients_per_parent", 12))
+        self.shared_threshold = int(learn.get("shared_ap_client_threshold", 12))
+
+    @classmethod
+    def load(cls, path):
+        data = Path(path).read_bytes()
+        return cls(json.loads(data), hashlib.sha256(data).hexdigest())
+
+    def label(self, cat):
+        return (self.categories.get(cat) or {}).get("label") or cat
+
+    def log_category(self, cat):
+        return (self.categories.get(cat) or {}).get("log_category") or cat
+
+    def mac_rule(self, mac):
+        h = hexmac(mac)
+        for n in self.prefix_lens:
+            hit = self.prefix.get(h[:n])
+            if hit:
+                return hit
+        return None, ""
+
+    def signals(self, d):
+        """Every rule that fires on one device. Each is a dict with class, rule, detail."""
+        out = []
+        rule, pfx = self.mac_rule(d["mac"])
+        if rule:
+            out.append({"class": rule["class"], "rule": rule["id"], "category": rule["category"],
+                        "company": rule["company"], "evidence": "oui", "prefix": pfx,
+                        "detail": f"{rule['company']} OUI {pfx}"})
+        else:
+            m = (d.get("manuf") or "").lower()
+            for needle, r in self.manuf:
+                if needle in m:
+                    out.append({"class": r["class"], "rule": r["id"], "category": r["category"],
+                                "company": r["company"], "evidence": "manuf", "prefix": d["mac"][:8],
+                                "detail": f"Kismet manufacturer “{d['manuf']}” (OUI lookup) = {r['company']}"})
+                    break
+        texts = [("SSID", d.get("ssid")), ("name", d.get("name"))]
+        for rx, r in self.names:
+            for field, t in texts:
+                if t and rx.search(t):
+                    out.append({"class": r["class"], "rule": r["id"], "category": r["category"],
+                                "company": r["company"], "evidence": "name",
+                                "detail": f"{field} “{t}” matches {r['company']} model/product name"})
+                    break
+        for u in d.get("uuids") or []:
+            r = self.uuids.get(u)
+            if r:
+                out.append({"class": r["class"], "rule": r["id"], "category": r["category"],
+                            "company": r["company"], "evidence": "ble", "detail": f"BLE service UUID {u} ({r['company']})"})
+        for field, t in texts:
+            hit = self.agency.search(t or "")
+            if hit:
+                out.append({"class": "agency", "rule": "agency-words", "category": "", "company": "",
+                            "evidence": "name", "word": hit.group(0),
+                            "detail": f"{field} “{t}” contains the agency word “{hit.group(0)}”"})
+                break
+        return out
+
+    def hardware(self, sigs):
+        """The device-class signal, if any, and its LE reason."""
+        for s in sigs:
+            if s["class"] == "device":
+                via = "OUI" if s["evidence"] == "oui" else "Kismet manufacturer lookup"
+                return s, (f"Hardware: {s['company']} {via} {s['prefix']} — {self.label(s['category'])} "
+                           f"[rule {s['rule']}, rules {self.version}]")
+        return None, ""
+
+    def consumer_radio(self, manuf):
+        m = (manuf or "").lower()
+        return next((c for c in self.consumer if c in m), "")
+
+    def notes(self, sig, d):
+        """('why it might be', 'why it might not be') for one Review signal."""
+        cls, k = sig.get("class"), sig.get("kind", "")
+        if cls == "fleet":
+            basis = next((r.get("basis", "") for r in self.raw.get("rules", []) if r["id"] == sig["rule"]), "")
+            return (f"{sig['detail']}: {sig['company']} makes {self.label(sig['category'])} equipment sold to law enforcement.",
+                    f"{basis} A vendor OUI names the maker only: it does not show what this unit is, or who owns or uses it.")
+        if cls == "name":
+            rule, _ = self.mac_rule(d["mac"])
+            same = rule and rule["company"].split()[0].lower().strip(",") == sig["company"].split()[0].lower().strip(",")
+            return (f"{sig['detail']}.", "Anyone can set a network or device name"
+                    + ("; the MAC block is the same vendor's, but that vendor also sells to non-police buyers."
+                       if same else "; the MAC is not one of that vendor's blocks."))
+        if cls == "laa":
+            return (f"{sig['detail']} is in Kismet's built-in Axon bodycam list.",
+                    "Locally administered prefix, not an IEEE assignment; randomized MACs can land here by chance.")
+        if cls == "agency":
+            radio = self.consumer_radio(d.get("manuf"))
+            nope = "Words in a network name are not hardware evidence."
+            if radio:
+                nope += f" The radio is {d.get('manuf')}, ordinary consumer equipment."
+            elif re.search(r"unknown", d.get("manuf") or "", re.I) or randomized(d["mac"]):
+                nope += " The MAC is locally administered or unknown, typical of consumer guest networks."
+            return (f"{sig['detail']}.", nope + " No LE-log device has an association with it.")
+        if k == "probe-confirmed-ssid":
+            return (f"It probed for “{sig['ssid']}”, the SSID of LE-log AP {sig['parent']}.",
+                    "A probe names an SSID, not a particular access point; other networks can share the name.")
+        if k == "probed-by-confirmed":
+            return (f"LE-log device {sig['parent']} probed for this AP's SSID “{sig['ssid']}”.",
+                    "A probe does not identify a particular access point.")
+        if k == "adjacent-mac":
+            return (f"MAC is adjacent to LE-log device {sig['parent']}; dual-radio units often use consecutive MACs.",
+                    "Consecutive MACs can belong to unrelated units of the same vendor.")
+        if k == "shared-ap":
+            return (f"LE-log device {sig['parent']} has a Kismet association record with this AP.",
+                    f"The AP looks shared ({sig['why']}), so it and its users are not assumed to be LE.")
+        if k == "association-unconfirmed":
+            role = "AP" if sig.get("role") == "ap" else "device"
+            probe = " A directed probe to that BSSID was observed." if sig.get("directed_probe") else ""
+            return (f"Kismet has a client record linking it with LE-log {role} {sig['parent']}.",
+                    "No data frame between them has been observed, so the record could come from a directed probe or an "
+                    f"authentication/association attempt.{probe} It becomes Learned automatically when Kismet records a "
+                    "retried or fragmented data frame, or DHCP/EAP/CDP/IP data, for this pair.")
+        if k == "parent-withdrawn":
+            return (f"Was Learned from {sig['parent']} ({sig.get('reason', '')[:160]}).",
+                    f"{sig['parent']} is no longer in the LE log (withdrawn {sig.get('at', '?')}). It is learned again "
+                    "automatically if it has data-frame evidence with another LE-log device.")
+        if k == "learned-unsupported":
+            return (f"Was in the LE log as: {sig.get('reason', '')[:200]}.",
+                    "That row was based on a Kismet client record without data-frame evidence (could be a probe). "
+                    "It becomes Learned again automatically when data-frame evidence is observed.")
+        if k == "operator-unmarked":
+            return (f"Was in the LE log until the operator removed it ({sig.get('at', '?')}).",
+                    f"Operator: {sig.get('note', '')}")
+        if k == "legacy-le-row":
+            return (sig.get("detail", "") + ".", "")
+        if k == "parent-full":
+            return (f"Kismet association record with LE-log AP {sig['parent']}.",
+                    f"{sig['parent']} already has {sig['count']} learned clients; it may be a shared network.")
+        return (sig.get("detail", ""), "")
+
+
+# --------------------------------------------------------------------------
+# Logs
+
+class Logs:
+    def __init__(self, rules=None, out=None):
+        self.out = Path(out or OUT)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.rules = rules or Rules()
+        self.lock = threading.RLock()
+        self.db = {}
+        for fname, ddl in SCHEMA.items():
+            con = sqlite3.connect(self.out / fname, timeout=30, check_same_thread=False)
+            con.execute("PRAGMA journal_mode=DELETE")
+            con.execute("PRAGMA synchronous=NORMAL")
+            con.execute(ddl)
+            con.commit()
+            self.db[fname] = con
+        le = self.db["law_enforcement.sqlite"]
+        # Remove the confidence column if an earlier version added it.
+        if "confidence" in [r[1] for r in le.execute("PRAGMA table_info(law_enforcement)")]:
+            le.execute("ALTER TABLE law_enforcement DROP COLUMN confidence")
+            le.commit()
+        # Review/override store, attached so LE + Review commit atomically.
+        le.execute("ATTACH DATABASE ? AS rv", (str(self.out / REVIEW_DB),))
+        le.execute("PRAGMA rv.journal_mode=DELETE")
+        le.execute("PRAGMA rv.synchronous=NORMAL")
+        for ddl in REVIEW_SCHEMA:
+            le.execute(ddl)
+        le.commit()
+        self.le = le
+        self.le_dirty = True      # export once at startup, then only on LE changes
+        self.changed_macs = []
+        self._confirmed = None
+        self.learned_seen = set()   # (child, parent) already handled this run
+        self.events = collections.deque(maxlen=50)
+        self.watched = {m for (m,) in le.execute(
+            "SELECT mac FROM rv.review WHERE status='open' AND signals LIKE '%\"watch\": true%'")}
+        self.open_review = {m for (m,) in le.execute("SELECT mac FROM rv.review WHERE status='open'")}
+        # Review rows resolved as deprioritized or dismissed: no "seen again" notices for them.
+        self.quiet = {m for (m,) in le.execute("SELECT mac FROM rv.resolution WHERE state<>'active'")}
+        self.resolved_at = 0.0
+        self.sessions = {}        # mac -> current sighting session (in memory)
+        self.notified = {}        # mac -> epoch of the last re-sighting notice
+        self.observed_mem = {}    # mac -> last_epoch written to rv.observed (minute throttle)
+        self.just_created = set() # Review rows created in this transaction (their first sighting is not "again")
+        self.boot = str(int(time.time()))
+        self.rev = 0              # bumped on every commit that changed LE or Review
+        self.rev_dirty = False
+
+    # ---- generic row helpers (unchanged semantics)
+
+    def _get(self, fname, table, mac):
+        con = self.le if fname in ("law_enforcement.sqlite", "rv") else self.db[fname]
+        cur = con.execute(f"SELECT * FROM {table} WHERE mac=?", (mac,))
+        row = cur.fetchone()
+        return dict(zip([c[0] for c in cur.description], row)) if row else None
+
+    def _put(self, fname, table, new, old):
+        """Insert, or update only if something actually changed."""
+        if old is not None:
+            new["first_seen"] = min(old["first_seen"] or new["first_seen"], new["first_seen"])
+            new["last_seen"] = max(old["last_seen"] or "", new["last_seen"])
+            # Never blank out something we learned earlier.
+            for k, v in old.items():
+                if new.get(k) in ("", None) and v not in ("", None):
+                    new[k] = v
+            if all(new[k] == old[k] for k in new):
+                return 0
+        cols = ", ".join(new)
+        marks = ", ".join("?" * len(new))
+        con = self.le if fname in ("law_enforcement.sqlite", "rv") else self.db[fname]
+        con.execute(f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({marks})", list(new.values()))
+        if con is self.le:
+            self.rev_dirty = True
+        return 1
+
+    def close(self):
+        """Close every database connection (the attached Review store closes with the LE one)."""
+        for con in self.db.values():
+            con.close()
+
+    def earliest(self, mac, first):
+        """Earliest first_seen known for this MAC in any of the logs."""
+        best = first
+        for fname, table in (("access_points.sqlite", "access_points"), ("wifi_clients.sqlite", "wifi_clients")):
+            r = self.db[fname].execute(f"SELECT first_seen FROM {table} WHERE mac=?", (mac,)).fetchone()
+            if r and r[0] and r[0] < best:
+                best = r[0]
+        r = self.le.execute("SELECT first_seen FROM rv.review WHERE mac=?", (mac,)).fetchone()
+        if r and r[0] and r[0] < best:
+            best = r[0]
+        return best
+
+    def known(self, macs):
+        """Seen-before lookup for the UI: MAC -> {first_seen, log} from the AP/client logs.
+        Only MAC and first_seen leave the logger; nothing is written."""
+        out = {}
+        with self.lock:
+            for mac in macs:
+                best = None
+                for fname, table, log in (("access_points.sqlite", "access_points", "access point"),
+                                          ("wifi_clients.sqlite", "wifi_clients", "client")):
+                    r = self.db[fname].execute(f"SELECT first_seen FROM {table} WHERE mac=?", (mac,)).fetchone()
+                    if r and r[0] and (best is None or r[0] < best[0]):
+                        best = (r[0], log)
+                if best:
+                    out[mac] = {"first_seen": best[0], "log": best[1]}
+        return out
+
+    # ---- LE rows
+
+    def confirmed(self):
+        """MAC -> LE row for Hardware/Operator rows (the only possible parents)."""
+        if self._confirmed is None:
+            cur = self.le.execute("SELECT * FROM law_enforcement")
+            cols = [c[0] for c in cur.description]
+            self._confirmed = {}
+            for r in cur:
+                row = dict(zip(cols, r))
+                if kind_of(row["match_reason"]) in ("hardware", "operator"):
+                    self._confirmed[row["mac"]] = row
+        return self._confirmed
+
+    def le_upsert(self, d, kind, category, reason):
+        """Write an LE row, keeping the strongest reason a MAC has ever had."""
+        old = self._get("law_enforcement.sqlite", "law_enforcement", d["mac"])
+        if old:
+            okind = kind_of(old["match_reason"])
+            if STRENGTH[okind] > STRENGTH[kind] or (okind == kind and kind in ("learned", "operator")):
+                category, reason = old["category"], old["match_reason"]
+        first = ts(d["first"]) if d.get("first") else ts(None)
+        if not old:
+            first = self.earliest(d["mac"], first)
+        radio, dtype = kept_role(old, d)
+        row = {
+            "mac": d["mac"], "category": category,
+            "radio": radio,
+            "type": dtype, "name": d.get("ssid") or d.get("name") or "",
+            "manufacturer": d.get("manuf") or "", "match_reason": reason,
+            "encryption": d.get("crypt") or "",
+            "first_seen": first, "last_seen": day(d.get("last"))}
+        n = self._put("law_enforcement.sqlite", "law_enforcement", row, old)
+        if n:
+            self.le_dirty = True
+            self._confirmed = None
+            self.changed_macs.append(d["mac"])
+            new_kind = kind_of(row["match_reason"])
+            if not old or kind_of(old["match_reason"]) != new_kind:
+                self.events.append({"at": time.time(), "mac": d["mac"], "kind": new_kind,
+                                    "seen": d.get("last") or 0, "first": d.get("first") or 0})
+            self.le.execute("UPDATE rv.review SET status='promoted', updated=? WHERE mac=? AND status='open'",
+                            (ts(None), d["mac"]))
+            self.open_review.discard(d["mac"])
+        return n
+
+    # ---- Review rows
+
+    def review_upsert(self, d, sigs, source="logger"):
+        """Merge Review signals for one device. Writes only when something changed."""
+        if not sigs:
+            return 0
+        old = self._get("rv", "rv.review", d["mac"])
+        keep = json.loads(old["signals"]) if old and old.get("signals") else []
+        seen = {(s.get("kind") or s.get("class"), s.get("detail")) for s in keep}
+        for s in sigs:
+            s = {k: v for k, v in s.items() if v not in (None, "")}
+            key = (s.get("kind") or s.get("class"), s.get("detail"))
+            if key not in seen:
+                seen.add(key)
+                keep.append(s)
+        be, nope = [], []
+        for s in keep:
+            a, b = self.rules.notes(s, d)
+            if a and a not in be:
+                be.append(a)
+            if b and b not in nope:
+                nope.append(b)
+        in_le = self.le.execute("SELECT 1 FROM law_enforcement WHERE mac=?", (d["mac"],)).fetchone()
+        status = (old or {}).get("status") or ("promoted" if in_le else "open")
+        first = ts(d["first"]) if d.get("first") else ts(None)
+        radio, dtype = kept_role(old, d)
+        new = {
+            "mac": d["mac"], "radio": radio, "type": dtype,
+            "name": d.get("ssid") or d.get("name") or "", "manufacturer": d.get("manuf") or "",
+            "signals": json.dumps(keep, sort_keys=True), "why_might_be": " ".join(be),
+            "why_might_not": " ".join(nope), "status": status,
+            "source": (old or {}).get("source") or source,
+            "first_seen": first if old else self.earliest(d["mac"], first),
+            "last_seen": day(d.get("last")), "updated": (old or {}).get("updated") or ts(None)}
+        if old is not None:
+            cmp = dict(new)
+            cmp["first_seen"] = min(old["first_seen"] or cmp["first_seen"], cmp["first_seen"])
+            cmp["last_seen"] = max(old["last_seen"] or "", cmp["last_seen"])
+            for k, v in old.items():
+                if cmp.get(k) in ("", None) and v not in ("", None):
+                    cmp[k] = v
+            if all(cmp[k] == old[k] for k in cmp if k != "updated"):
+                return 0
+            new["updated"] = ts(None)
+        else:
+            self.events.append({"at": time.time(), "mac": d["mac"], "kind": "review",
+                                "seen": d.get("last") or 0, "first": d.get("first") or 0})
+        if status == "open":
+            self.open_review.add(d["mac"])
+            if old is None:
+                self.just_created.add(d["mac"])
+        return self._put("rv", "rv.review", new, old)
+
+    # ---- per-device logging (AP / client logs unchanged)
+
+    def record(self, d):
+        if not d["mac"]:
+            return 0
+        return self.log_device(d) + self.classify(d)
+
+    def log_device(self, d):
+        """access_points / wifi_clients rows (unchanged semantics)."""
+        if not d["mac"]:
+            return 0
+        changed = 0
+        first, last = ts(d["first"]), day(d["last"])
+        role = log_role(d)
+        if role == "ap":
+            old = self._get("access_points.sqlite", "access_points", d["mac"])
+            changed += self._put("access_points.sqlite", "access_points", {
+                "mac": d["mac"], "ssid": d["ssid"] or d["name"],
+                "type": d["type"].replace("Wi-Fi ", ""),
+                "encryption": d["crypt"], "channel": d["channel"],
+                "manufacturer": d["manuf"],
+                "hidden": int(not (d["ssid"] or d["name"])),
+                "first_seen": first, "last_seen": last}, old)
+        elif role == "client":
+            # Randomized MACs rotate, so one phone would become many rows (log_role skips them).
+            old = self._get("wifi_clients.sqlite", "wifi_clients", d["mac"])
+            changed += self._put("wifi_clients.sqlite", "wifi_clients", {
+                "mac": d["mac"], "manufacturer": d["manuf"], "name": d["name"],
+                "randomized_mac": randomized(d["mac"]),
+                "probed_ssids": merge_list(old and old["probed_ssids"], d["probed"]),
+                "connected_ap": d["bssid"],
+                "type": d["type"].replace("Wi-Fi ", ""),
+                "first_seen": first, "last_seen": last}, old)
+        return changed
+
+    def sight(self, d):
+        """Bounded re-sighting history for open Review devices, with rate-limited notices."""
+        mac = d["mac"]
+        obs = d.get("last") or time.time()
+        cur = self.sessions.get(mac)
+        if cur is None:
+            row = self.le.execute("SELECT id, end_at, polls FROM rv.sightings WHERE mac=? ORDER BY id DESC LIMIT 1",
+                                  (mac,)).fetchone()
+            cur = {"id": row[0], "end": epoch(row[1]), "written": epoch(row[1]), "polls": row[2]} if row else {}
+            self.sessions[mac] = cur
+        if cur and obs - cur["end"] <= SIGHT_GAP:
+            if obs > cur["end"]:
+                cur["end"] = obs
+                cur["polls"] += 1
+                if cur["end"] - cur["written"] >= SIGHT_WRITE_EVERY:
+                    self.le.execute("UPDATE rv.sightings SET end_at=?, polls=? WHERE id=?",
+                                    (ts(cur["end"]), cur["polls"], cur["id"]))
+                    cur["written"] = cur["end"]
+                    self.rev_dirty = True
+            return
+        rv = self.le.execute("SELECT first_seen FROM rv.review WHERE mac=?", (mac,)).fetchone()
+        detail = {"name": d.get("ssid") or d.get("name") or "", "type": d.get("type") or "",
+                  "assoc": {b: r["evidence"] or "record only" for b, r in sorted((d.get("assoc_to") or {}).items())[:10]},
+                  "assoc_clients": len(d.get("assoc_clients") or []), "probes": (d.get("probed") or [])[:5]}
+        c = self.le.execute("INSERT INTO rv.sightings (mac, start_at, end_at, polls, detail) VALUES (?,?,?,?,?)",
+                            (mac, ts(obs), ts(obs), 1, json.dumps(detail)))
+        self.le.execute("DELETE FROM rv.sightings WHERE mac=? AND id NOT IN "
+                        "(SELECT id FROM rv.sightings WHERE mac=? ORDER BY id DESC LIMIT ?)", (mac, mac, SIGHT_KEEP))
+        self.rev_dirty = True
+        first_seen = epoch(rv[0]) if rv and rv[0] else 0
+        resight = bool(cur) or bool(first_seen and obs - first_seen > SIGHT_GAP and mac not in self.just_created)
+        self.sessions[mac] = {"id": c.lastrowid, "end": obs, "written": obs, "polls": 1}
+        if not resight or mac in self.quiet:    # sightings are still kept for resolved rows
+            return
+        watched = mac in self.watched
+        last = self.notified.get(mac)
+        if last is None:
+            r = self.le.execute("SELECT max(at) FROM rv.audit WHERE mac=? AND action IN ('resighted','seen-again')",
+                                (mac,)).fetchone()
+            last = epoch(r[0]) if r and r[0] else 0
+        if not watched and obs - last < NOTIFY_EVERY:
+            return
+        self.notified[mac] = obs
+        gap = obs - cur["end"] if cur else obs - first_seen
+        self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                        (ts(None), "logger", "seen-again" if watched else "resighted", mac,
+                         json.dumps(dict(detail, kismet_last_time=ts(obs), absent_for_s=int(gap), watched=watched))))
+        print(f"Review device {mac} seen again after {int(gap)}s{' (watched)' if watched else ''}", flush=True)
+
+    def classify(self, d):
+        """Hardware or operator -> LE; weaker signals -> Review. Then the Review sighting log."""
+        n = self._classify(d)
+        if d["mac"] in self.open_review:
+            self.sight(d)
+            self.observe(d)
+        elif self.le.execute("SELECT 1 FROM law_enforcement WHERE mac=?", (d["mac"],)).fetchone():
+            self.observe(d)
+        return n
+
+    def observe(self, d):
+        """Record Kismet's last_time for an LE/Review MAC, at most once per minute per MAC.
+        Never invents a time: no Kismet time, or one in the future, is not stored."""
+        obs = int(d.get("last") or 0)
+        if obs <= 0 or obs > time.time() + OBSERVE_FUTURE_SLACK:
+            return
+        prev = self.observed_mem.get(d["mac"])
+        if prev is None:
+            r = self.le.execute("SELECT last_epoch FROM rv.observed WHERE mac=?", (d["mac"],)).fetchone()
+            prev = r[0] if r else 0
+        if obs // 60 <= prev // 60:
+            self.observed_mem[d["mac"]] = prev
+            return
+        self.le.execute("INSERT INTO rv.observed (mac, last_epoch, updated) VALUES (?,?,?) "
+                        "ON CONFLICT(mac) DO UPDATE SET last_epoch=max(last_epoch, excluded.last_epoch), updated=excluded.updated",
+                        (d["mac"], obs, ts(None)))
+        self.observed_mem[d["mac"]] = obs
+        self.rev_dirty = True
+
+    # ---- Review resolution (REVIEW_POLICY)
+
+    def resolve_review(self, now=None):
+        """Apply REVIEW_POLICY to every open Review row. Writes a decision only when it changes
+        (state, rule, or the signal kinds it was based on), with a log entry saying why. Operator
+        decisions (locked) and operator-watched or unmarked rows are never changed here.
+        Returns the number of decisions written."""
+        now = now or time.time()
+        observed = dict(self.le.execute("SELECT mac, last_epoch FROM rv.observed").fetchall())
+        current = {r[0]: r for r in self.le.execute("SELECT mac, state, rule, basis, locked FROM rv.resolution")}
+        n = 0
+        cur = self.le.execute("SELECT * FROM rv.review WHERE status='open'")
+        cols = [c[0] for c in cur.description]
+        for values in cur.fetchall():
+            row = dict(zip(cols, values))
+            row["signals"] = json.loads(row["signals"] or "[]")
+            mac = row["mac"]
+            old = current.get(mac)
+            last = max(observed.get(mac) or 0, epoch(row.get("last_seen") or ""))
+            dec = review_decision(self.rules, row, last, now)
+            if old and old[4]:                          # locked by an operator decision
+                if dec and old[3] != dec[5]:            # new evidence since: record it, keep the decision
+                    self._resolution_log(mac, old[1], old[1], old[2], "logger",
+                                         "New evidence after the operator's decision; the decision is kept.", dec[5])
+                    self.le.execute("UPDATE rv.resolution SET basis=? WHERE mac=?", (dec[5], mac))
+                    n += 1
+                continue
+            if dec is None:                             # operator territory: no automatic decision
+                if old:
+                    self.le.execute("DELETE FROM rv.resolution WHERE mac=?", (mac,))
+                    self._resolution_log(mac, old[1], "active", "operator-watched", "logger",
+                                         "Watched or unmarked by an operator; automation does not decide it.", "")
+                    n += 1
+                self.quiet.discard(mac)
+                continue
+            state, rule, obs_text, why, unknown, basis = dec
+            if old and (old[1], old[2], old[3]) == (state, rule, basis):
+                continue
+            if old and old[1] != "active" and state == "active":
+                why = f"Reopened: {why}"
+            self.le.execute(
+                "INSERT INTO rv.resolution (mac, state, policy, rule, observed, why, unknown, basis, decided_at, decided_by, locked, note) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,0,'') ON CONFLICT(mac) DO UPDATE SET state=excluded.state, policy=excluded.policy, "
+                "rule=excluded.rule, observed=excluded.observed, why=excluded.why, unknown=excluded.unknown, basis=excluded.basis, "
+                "decided_at=excluded.decided_at, decided_by=excluded.decided_by",
+                (mac, state, REVIEW_POLICY, rule, obs_text, why, unknown, basis, ts(now), "logger"))
+            self._resolution_log(mac, old[1] if old else "", state, rule, "logger", why, basis)
+            (self.quiet.add if state != "active" else self.quiet.discard)(mac)
+            n += 1
+        # Decisions for rows that left Review (marked LE, promoted) are no longer needed.
+        gone = [m for (m,) in self.le.execute(
+            "SELECT mac FROM rv.resolution WHERE mac NOT IN (SELECT mac FROM rv.review WHERE status='open')")]
+        for m in gone:
+            self.le.execute("DELETE FROM rv.resolution WHERE mac=?", (m,))
+            self.quiet.discard(m)
+            n += 1
+        if n:
+            self.rev_dirty = True
+        self.resolved_at = now
+        return n
+
+    def _resolution_log(self, mac, frm, to, rule, by, why, basis):
+        self.le.execute("INSERT INTO rv.resolution_log (at, mac, from_state, to_state, policy, rule, by, why, basis) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (ts(None), mac, frm, to, REVIEW_POLICY, rule, by, why, basis))
+
+    def operator_resolve(self, mac, action, note, actor):
+        """An operator's decision on a Review row: "dismiss" or "keep" (active), locked against the
+        automation; "release" hands the row back to the policy. Returns a result dict."""
+        with self.lock:
+            try:
+                r = self.le.execute("SELECT 1 FROM rv.review WHERE mac=? AND status='open'", (mac,)).fetchone()
+                if not r:
+                    return {"ok": False, "mac": mac, "error": "not an open Review row"}
+                old = self.le.execute("SELECT state FROM rv.resolution WHERE mac=?", (mac,)).fetchone()
+                frm = old[0] if old else "active"
+                if action == "release":
+                    self.le.execute("DELETE FROM rv.resolution WHERE mac=?", (mac,))
+                    self._resolution_log(mac, frm, "active", "operator-release", actor, f"Handed back to {REVIEW_POLICY}. {note}".strip(), "")
+                    self.quiet.discard(mac)
+                    self.resolve_review()
+                else:
+                    state = "dismissed" if action == "dismiss" else "active"
+                    self.le.execute(
+                        "INSERT INTO rv.resolution (mac, state, policy, rule, observed, why, unknown, basis, decided_at, decided_by, locked, note) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(mac) DO UPDATE SET state=excluded.state, policy=excluded.policy, "
+                        "rule=excluded.rule, observed=excluded.observed, why=excluded.why, unknown=excluded.unknown, "
+                        "decided_at=excluded.decided_at, decided_by=excluded.decided_by, locked=1, note=excluded.note",
+                        (mac, state, REVIEW_POLICY, f"operator-{action}", "", f"Operator decision: {note}", "", "", ts(None), actor, note))
+                    self._resolution_log(mac, frm, state, f"operator-{action}", actor, note, "")
+                    (self.quiet.add if state != "active" else self.quiet.discard)(mac)
+                self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                                (ts(None), actor, f"review-{action}", mac, json.dumps({"note": note})))
+                self.rev_dirty = True
+                self.commit()
+                return {"ok": True, "mac": mac, "action": action}
+            except Exception:
+                self.rollback()
+                raise
+
+    def _classify(self, d):
+        sigs = self.rules.signals(d)
+        hw, reason = self.rules.hardware(sigs)
+        if hw:
+            return self.le_upsert(d, "hardware", self.rules.log_category(hw["category"]), reason)
+        ov = self._get("rv", "rv.overrides", d["mac"])
+        if ov:
+            old = self._get("law_enforcement.sqlite", "law_enforcement", d["mac"])
+            if old:   # keep the operator row fresh (last_seen etc.)
+                return self.le_upsert(d, kind_of(old["match_reason"]) or "operator", old["category"], old["match_reason"])
+        review = [s for s in sigs if s["class"] in ("fleet", "name", "laa", "agency")]
+        old = self.le.execute("SELECT match_reason FROM law_enforcement WHERE mac=?", (d["mac"],)).fetchone()
+        n = 0
+        if old and kind_of(old[0]) in ("hardware", "operator", "learned"):
+            n += self.le_upsert(d, kind_of(old[0]), "", "")   # refresh last_seen; reason is kept
+        return n + self.review_upsert(d, review)
+
+    # ---- relationships
+
+    def learn(self, batch, fetch_one=None):
+        """One-hop learning from Kismet association records. Returns rows written."""
+        rules = self.rules
+        conf = self.confirmed()
+        by_mac = {d["mac"]: d for d in batch}
+        n = 0
+
+        def get(mac):
+            if mac in by_mac:
+                return by_mac[mac]
+            if fetch_one:
+                d = fetch_one(mac)
+                if d:
+                    by_mac[mac] = d
+                return d
+            return None
+
+        def parent_label(p):
+            row = conf[p]
+            k = kind_of(row["match_reason"])
+            return f"{k} — {row['manufacturer'] or row['name'] or row['category']}"
+
+        def learned_count(p):
+            return self.le.execute("SELECT COUNT(*) FROM law_enforcement WHERE match_reason LIKE ?",
+                                   (f"Learned: associated client of confirmed LE AP {p}%",)).fetchone()[0]
+
+        def unconfirmed(dev, p, role, probed_from):
+            """A client record without data-frame evidence: Review, promoted later if data appears."""
+            nonlocal n
+            n += self.review_upsert(dev, [{
+                "kind": "association-unconfirmed", "parent": p, "role": role,
+                "directed_probe": p in (probed_from.get("probe_bssids") or []),
+                "detail": f"client record with confirmed LE {'AP' if role == 'ap' else 'device'} {p}, no data frames"}])
+
+        def learn_client(c, p, rec):
+            nonlocal n
+            if c["mac"] in conf or (c["mac"], p) in self.learned_seen:
+                return
+            row = self.le.execute("SELECT match_reason FROM law_enforcement WHERE mac=?", (c["mac"],)).fetchone()
+            if row and STRENGTH[kind_of(row[0])] >= STRENGTH["learned"]:
+                self.learned_seen.add((c["mac"], p))
+                return
+            if not rec or not rec["data"]:
+                return unconfirmed(c, p, "ap", c)
+            self.learned_seen.add((c["mac"], p))
+            have = learned_count(p)
+            if have >= rules.max_clients:
+                n += self.review_upsert(c, [{"kind": "parent-full", "parent": p, "count": have,
+                                             "detail": f"association with confirmed LE AP {p} (cap reached)"}])
+                return
+            reason = (f"Learned: associated client of confirmed LE AP {p} ({parent_label(p)}); "
+                      f"evidence: Kismet client record for BSSID {p} shows {rec['evidence']} (data frames need a "
+                      f"completed association); record first {ts(rec['first']) if rec['first'] else '?'} "
+                      f"last {ts(rec['last']) if rec['last'] else '?'}; recorded {ts(None)}")
+            n += self.le_upsert(c, "learned", rules.log_category("learned"), reason)
+
+        def learn_ap(a, h, rec, hw):
+            nonlocal n
+            if a["mac"] in conf or (a["mac"], h) in self.learned_seen:
+                return
+            row = self.le.execute("SELECT match_reason FROM law_enforcement WHERE mac=?", (a["mac"],)).fetchone()
+            if row and STRENGTH[kind_of(row[0])] >= STRENGTH["learned"]:
+                self.learned_seen.add((a["mac"], h))
+                return
+            if not rec or not rec["data"]:
+                return unconfirmed(a, h, "device", hw)
+            self.learned_seen.add((a["mac"], h))
+            name = (a.get("ssid") or a.get("name") or "").strip()
+            why = ""
+            if name.lower() in rules.public:
+                why = f"public SSID “{name}”"
+            elif len(a.get("assoc_clients") or []) > rules.shared_threshold:
+                why = f"{len(a['assoc_clients'])} associated clients"
+            if why:
+                n += self.review_upsert(a, [{"kind": "shared-ap", "parent": h, "why": why,
+                                             "detail": f"association from confirmed LE device {h}; {why}"}])
+                return
+            reason = (f"Learned: access point joined by confirmed LE device {h} ({parent_label(h)}); "
+                      f"evidence: Kismet client record of {h} for this BSSID shows {rec['evidence']} (data frames need "
+                      f"a completed association); record first {ts(rec['first']) if rec['first'] else '?'} "
+                      f"last {ts(rec['last']) if rec['last'] else '?'}; recorded {ts(None)}")
+            n += self.le_upsert(a, "learned", rules.log_category("learned"), reason)
+
+        ap_ssids = None
+        for d in list(batch):
+            mac = d["mac"]
+            # Client side: this device has an association record with B.
+            for b, rec in d.get("assoc_to", {}).items():
+                if b in conf and conf[b]["type"] in AP_TYPES and d["type"] in CLIENT_TYPES:
+                    learn_client(d, b, rec)
+                elif mac in conf and d["type"] not in AP_TYPES:
+                    a = get(b)
+                    if a and a["type"] in AP_TYPES:
+                        learn_ap(a, mac, rec, d)
+            # AP side: Kismet lists clients associated with this AP.
+            if d["type"] in AP_TYPES:
+                for c_mac in d.get("assoc_clients", []):
+                    if mac in conf:
+                        if c_mac in conf or (c_mac, mac) in self.learned_seen:
+                            continue
+                        c = get(c_mac)
+                        if c and c["type"] in CLIENT_TYPES:
+                            learn_client(c, mac, c.get("assoc_to", {}).get(mac))
+                    elif c_mac in conf and conf[c_mac]["type"] not in AP_TYPES and conf[c_mac]["radio"] == "Wi-Fi":
+                        h = get(c_mac)
+                        if h:
+                            learn_ap(d, c_mac, h.get("assoc_to", {}).get(mac), h)
+            # Probes: Review notes only.
+            if d.get("probed"):
+                conf_ssids = {r["name"].lower(): m for m, r in conf.items() if r["type"] in AP_TYPES and r["name"]}
+                for s in d["probed"]:
+                    p = conf_ssids.get(s.lower())
+                    if p and p != mac and mac not in conf and s.lower() not in rules.public:
+                        n += self.review_upsert(d, [{"kind": "probe-confirmed-ssid", "parent": p, "ssid": s,
+                                                     "detail": f"probed “{s}” (SSID of confirmed LE AP {p})"}])
+                if mac in conf:
+                    if ap_ssids is None:
+                        ap_ssids = collections.defaultdict(set)
+                        for m2, s2 in self.db["access_points.sqlite"].execute(
+                                "SELECT mac, ssid FROM access_points WHERE ssid != ''"):
+                            ap_ssids[s2.lower()].add(m2)
+                        for d2 in batch:
+                            if d2["type"] in AP_TYPES and d2.get("ssid"):
+                                ap_ssids[d2["ssid"].lower()].add(d2["mac"])
+                    for s in d["probed"]:
+                        if s.lower() in rules.public:
+                            continue
+                        for m2 in sorted(ap_ssids.get(s.lower(), ()))[:20]:
+                            if m2 in conf:
+                                continue
+                            a = get(m2) or self.ap_from_log(m2)
+                            if a:
+                                n += self.review_upsert(a, [{"kind": "probed-by-confirmed", "parent": mac, "ssid": s,
+                                                             "detail": f"SSID “{s}” probed by confirmed LE device {mac}"}])
+            # Adjacent MAC to a confirmed device of the same block: Review note.
+            if mac not in conf:
+                h = hexmac(mac)
+                if len(h) == 12:
+                    v = int(h, 16)
+                    for nb in (v - 1, v + 1):
+                        nm = norm_mac(f"{nb & 0xFFFFFFFFFFFF:012X}")
+                        if nm in conf and nm[:8] == mac[:8]:
+                            n += self.review_upsert(d, [{"kind": "adjacent-mac", "parent": nm,
+                                                         "detail": f"adjacent to confirmed LE device {nm}"}])
+        return n
+
+    def ap_from_log(self, mac):
+        r = self._get("access_points.sqlite", "access_points", mac)
+        if not r:
+            return None
+        return {"mac": mac, "type": "Wi-Fi " + (r["type"] or "AP"), "phy": "IEEE802.11", "name": r["ssid"] or "",
+                "ssid": r["ssid"] or "", "manuf": r["manufacturer"] or "", "crypt": r["encryption"] or "",
+                "channel": r["channel"] or "", "first": 0, "last": 0, "probed": [], "bssid": "",
+                "assoc_to": {}, "assoc_clients": [], "uuids": []}
+
+    # ---- operator actions
+
+    def mark(self, mac, note, actor, source_ip, fetch_one=None):
+        if quarantined({"mac": mac}, self.out):
+            return {"ok": False, "mac": mac, "error": "a test-fixture MAC is never written to the real logs"}
+        with self.lock:
+            try:
+                conf_old = self._get("law_enforcement.sqlite", "law_enforcement", mac)
+                rv = self._get("rv", "rv.review", mac)
+                d = (fetch_one(mac) if fetch_one else None) or self.ap_from_log(mac)
+                if not d:
+                    src = conf_old or rv or self._get("wifi_clients.sqlite", "wifi_clients", mac) or {}
+                    d = {"mac": mac, "type": src.get("type") or "", "phy": "Bluetooth" if src.get("radio") == "Bluetooth" else "IEEE802.11",
+                         "name": src.get("name") or "", "ssid": "", "manuf": src.get("manufacturer") or "",
+                         "crypt": src.get("encryption") or "", "first": 0, "last": 0}
+                now = ts(None)
+                self.le.execute(
+                    "INSERT OR REPLACE INTO rv.overrides (mac, note, actor, source_ip, created, name, manufacturer, radio, type)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (mac, note, actor, source_ip, now, d.get("ssid") or d.get("name") or "", d.get("manuf") or "",
+                     radio_of(d.get("phy")), d.get("type") or ""))
+                cat = "operator-confirmed"
+                if rv and rv.get("signals"):
+                    for s in json.loads(rv["signals"]):
+                        if s.get("category"):
+                            cat = self.rules.log_category(s["category"])
+                            break
+                reason = f"Operator: marked LE by {actor} from {source_ip} at {now}. Note: {note}"
+                if rv and rv.get("why_might_be"):
+                    reason += f" | Review evidence then: {rv['why_might_be']}"
+                n = self.le_upsert(d, "operator", cat, reason)
+                self.le.execute("UPDATE rv.review SET status='marked', updated=? WHERE mac=?", (now, mac))
+                self.watched.discard(mac)
+                self.open_review.discard(mac)
+                self.rev_dirty = True
+                self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                                (now, actor, "mark", mac, json.dumps({"note": note, "source_ip": source_ip,
+                                                                       "le_row_before": conf_old, "le_written": bool(n)})))
+                self.commit()
+                return {"ok": True, "mac": mac, "le_written": bool(n),
+                        "kept_stronger": bool(conf_old and kind_of(conf_old["match_reason"]) == "hardware")}
+            except Exception:
+                self.rollback()
+                raise
+
+    def unmark(self, mac, note, actor, source_ip):
+        with self.lock:
+            try:
+                now = ts(None)
+                ov = self._get("rv", "rv.overrides", mac)
+                row = self._get("law_enforcement.sqlite", "law_enforcement", mac)
+                removed = False
+                if row and kind_of(row["match_reason"]) == "operator":
+                    self.le.execute("DELETE FROM law_enforcement WHERE mac=?", (mac,))
+                    removed = True
+                    self.le_dirty = True
+                    self._confirmed = None
+                self.le.execute("DELETE FROM rv.overrides WHERE mac=?", (mac,))
+                self.rev_dirty = True
+                self.to_review_after_unmark(mac, row or ov, note, now)
+                children = self.withdraw_parent(mac, now) if removed else []
+                self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                                (now, actor, "unmark", mac, json.dumps({"note": note, "source_ip": source_ip,
+                                                                         "override_before": ov, "le_row_removed": row if removed else None,
+                                                                         "learned_children_reevaluated": children})))
+                self.le_dirty = True
+                self.commit()
+                return {"ok": True, "mac": mac, "had_override": bool(ov), "le_row_removed": removed,
+                        "learned_children_reevaluated": children}
+            except Exception:
+                self.rollback()
+                raise
+
+    def to_review_after_unmark(self, mac, row, note, now):
+        """Keep the evidence: an unmarked device goes (back) to Review and is watched."""
+        row = row or {}
+        d = self.ap_from_log(mac) or {
+            "mac": mac, "type": row.get("type") or "", "name": row.get("name") or "", "ssid": row.get("name") or "",
+            "manuf": row.get("manufacturer") or "", "crypt": row.get("encryption") or "",
+            "phy": "BTLE" if row.get("radio") == "Bluetooth" else "IEEE802.11", "first": 0, "last": 0, "uuids": []}
+        first = row.get("first_seen") or ""
+        last = row.get("last_seen") or ""
+        sigs = [s for s in self.rules.signals(d) if s["class"] in ("fleet", "name", "laa", "agency")]
+        sigs.append({"kind": "operator-unmarked", "class": "operator", "at": now, "note": note, "watch": True,
+                     "detail": f"operator removed the LE mark at {now}"})
+        self.review_upsert(d, sigs, source="operator")
+        self.open_review.add(mac)
+        self.le.execute("UPDATE rv.review SET status='open', updated=?,"
+                        " first_seen=CASE WHEN ?<>'' AND ?<first_seen THEN ? ELSE first_seen END,"
+                        " last_seen=CASE WHEN ?<>'' AND ?>last_seen AND ?<=? THEN ? ELSE last_seen END WHERE mac=?",
+                        (now, first, first, first, last, last, last, day(None), last, mac))
+        self.watched.add(mac)
+
+    def withdraw_parent(self, parent, now):
+        """Devices Learned from a withdrawn parent leave the LE log for Review. Learning runs
+        again on the next poll, so one with data-frame evidence to another confirmed parent
+        is learned again from that parent."""
+        moved = []
+        for r in self.le_rows():
+            if kind_of(r["match_reason"]) != "learned" or parent_of(r["match_reason"]) != parent:
+                continue
+            self.le.execute("DELETE FROM law_enforcement WHERE mac=?", (r["mac"],))
+            self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                            (now, "logger", "learned-withdrawn", r["mac"], json.dumps({"parent": parent, "le_row_removed": r})))
+            d = self.ap_from_log(r["mac"]) or self.row_device(r)
+            self.review_upsert(d, [{"kind": "parent-withdrawn", "parent": parent, "at": now,
+                                    "reason": r["match_reason"], "detail": f"learned from {parent}, withdrawn {now}"}],
+                               source="logger")
+            self.le.execute("UPDATE rv.review SET status='open', updated=? WHERE mac=?", (now, r["mac"]))
+            self.open_review.add(r["mac"])
+            self.learned_seen = {k for k in self.learned_seen if k[0] != r["mac"]}
+            moved.append(r["mac"])
+        if moved:
+            self._confirmed = None
+            self.le_dirty = True
+            self.rev_dirty = True
+        return moved
+
+    @staticmethod
+    def row_device(r):
+        return {"mac": r["mac"], "type": r.get("type") or "", "name": r.get("name") or "", "ssid": r.get("name") or "",
+                "manuf": r.get("manufacturer") or "", "crypt": r.get("encryption") or "",
+                "phy": "BTLE" if r.get("radio") == "Bluetooth" else "IEEE802.11", "first": 0, "last": 0, "uuids": []}
+
+    def audit_learned(self):
+        """Learned rows without data-frame evidence in their reason go to Review (re-learned when it appears)."""
+        now = ts(None)
+        moved = []
+        for r in self.le_rows():
+            if kind_of(r["match_reason"]) != "learned" or "evidence: Kismet client record" in r["match_reason"]:
+                continue
+            self.le.execute("DELETE FROM law_enforcement WHERE mac=?", (r["mac"],))
+            self.le.execute("INSERT INTO rv.audit (at, actor, action, mac, detail) VALUES (?,?,?,?,?)",
+                            (now, "audit", "learned-unsupported", r["mac"], json.dumps({"le_row_removed": r})))
+            self.review_upsert(self.ap_from_log(r["mac"]) or self.row_device(r),
+                               [{"kind": "learned-unsupported", "parent": parent_of(r["match_reason"]),
+                                 "reason": r["match_reason"], "detail": "learned row without data-frame evidence"}])
+            self.le.execute("UPDATE rv.review SET status='open', updated=? WHERE mac=?", (now, r["mac"]))
+            self.open_review.add(r["mac"])
+            moved.append(r["mac"])
+        self.le_dirty = True
+        self.commit()
+        return moved
+
+    def refresh_review_notes(self):
+        """Recompute stored why_might_be / why_might_not from each row's signals (after rule text changes)."""
+        n = 0
+        for mac, sig_json, manuf, name, why_be, why_not in self.le.execute(
+                "SELECT mac, signals, manufacturer, name, why_might_be, why_might_not FROM rv.review").fetchall():
+            d = {"mac": mac, "manuf": manuf, "ssid": name, "name": name}
+            be, nope = [], []
+            for x in json.loads(sig_json or "[]"):
+                a, b = self.rules.notes(x, d)
+                if a and a not in be:
+                    be.append(a)
+                if b and b not in nope:
+                    nope.append(b)
+            if (" ".join(be), " ".join(nope)) != (why_be, why_not):
+                self.le.execute("UPDATE rv.review SET why_might_be=?, why_might_not=?, updated=? WHERE mac=?",
+                                (" ".join(be), " ".join(nope), ts(None), mac))
+                self.rev_dirty = True
+                n += 1
+        self.commit()
+        return n
+
+    def repair_unmarked(self):
+        """Put devices unmarked before to_review_after_unmark existed into Review."""
+        n = 0
+        for (detail_json, at, mac) in self.le.execute(
+                "SELECT detail, at, mac FROM rv.audit WHERE action='unmark' ORDER BY id").fetchall():
+            if self.le.execute("SELECT 1 FROM law_enforcement WHERE mac=?", (mac,)).fetchone():
+                continue
+            have = self.le.execute("SELECT signals FROM rv.review WHERE mac=?", (mac,)).fetchone()
+            if have and "operator-unmarked" in have[0]:
+                continue
+            if self.le.execute("SELECT 1 FROM rv.audit WHERE mac=? AND action='unwatch' AND at>=?", (mac, at)).fetchone():
+                continue   # the watch was deliberately removed after this unmark
+            det = json.loads(detail_json)
+            self.to_review_after_unmark(mac, det.get("le_row_removed") or det.get("override_before"),
+                                        det.get("note", ""), at)
+            n += 1
+        self.commit()
+        return n
+
+    # ---- transactions and exports
+
+    def commit(self):
+        for con in self.db.values():
+            con.commit()   # self.le is in self.db; its commit covers rv atomically
+        if self.rev_dirty:
+            self.rev += 1
+            self.rev_dirty = False
+        self.just_created.clear()
+        if self.le_dirty:
+            self.export_le_history()
+            self.le_dirty = False
+
+    def rollback(self):
+        for con in self.db.values():
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+        self._confirmed = None
+        self.changed_macs = []
+        self.learned_seen.clear()
+        self.rev_dirty = False
+        self.just_created.clear()
+        self.sessions.clear()       # in-memory sessions may describe rolled-back rows
+
+    def le_rows(self):
+        cur = self.le.execute("SELECT * FROM law_enforcement ORDER BY first_seen DESC")
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur]
+
+    def history(self):
+        return {"updated": ts(None), "rules_version": self.rules.version, "devices": self.le_rows()}
+
+    def export_le_history(self):
+        """Private JSON copy (not web-served); the browser gets history from the API."""
+        if str(LE_HISTORY).lower() == "off" or not LE_HISTORY.parent.is_dir():
+            return
+        atomic_write(LE_HISTORY, json.dumps(self.history()), mode=0o640)
+
+    def token(self):
+        return f"{self.boot}-{self.rev}"
+
+    # Read-only Archive of everything stored, across all capture runs. Whitelisted tables and
+    # columns only; search and sort are parameterised; nothing here writes.
+    ARCHIVE = {
+        "ap": ("access_points.sqlite", "access_points", "Access points", "last_seen"),
+        "clients": ("wifi_clients.sqlite", "wifi_clients", "Wi-Fi clients", "last_seen"),
+        "le": ("law_enforcement.sqlite", "law_enforcement", "LE log", "last_seen"),
+        "review": ("rv", "rv.review", "Review (all states)", "last_seen"),
+        "decisions": ("rv", "rv.resolution_log", "Review decisions", "id"),
+        "audit": ("rv", "rv.audit", "Operator audit", "id"),
+        "sightings": ("rv", "rv.sightings", "Review sightings", "id"),
+        "overrides": ("rv", "rv.overrides", "Operator marks", "created"),
+    }
+
+    def archive(self, table, q="", page=0, length=50, sort="", desc=True):
+        if table not in self.ARCHIVE:
+            raise KeyError(table)
+        fname, tname, label, default_sort = self.ARCHIVE[table]
+        con = self.le if fname in ("law_enforcement.sqlite", "rv") else self.db[fname]
+        length = max(1, min(int(length), 200))
+        page = max(0, int(page))
+        with self.lock:
+            cols = [r[1] for r in con.execute(f"PRAGMA {'rv.' if tname.startswith('rv.') else ''}table_info({tname.split('.')[-1]})")]
+            sort = sort if sort in cols else default_sort
+            where, args = "", []
+            if q:
+                like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                text = [c for c in cols if c not in ("id", "polls", "hidden", "randomized_mac", "locked")]
+                where = " WHERE " + " OR ".join(f'"{c}" LIKE ? ESCAPE \'\\\'' for c in text)
+                args = [like] * len(text)
+            total = con.execute(f"SELECT COUNT(*) FROM {tname}{where}", args).fetchone()[0]
+            rows = con.execute(f'SELECT * FROM {tname}{where} ORDER BY "{sort}" {"DESC" if desc else "ASC"} LIMIT ? OFFSET ?',
+                               args + [length, page * length]).fetchall()
+        return {"table": table, "label": label, "columns": cols, "rows": [list(r) for r in rows], "total": total,
+                "page": page, "length": length, "sort": sort, "desc": bool(desc),
+                "tables": {k: v[2] for k, v in self.ARCHIVE.items()}}
+
+    # Combined Archive search over several tables: one shared, labelled result schema. Every column here
+    # is a fixed SQL expression per table (allowlist); user input only reaches LIKE parameters.
+    ARCHIVE_SHARED = {
+        "ap": ("mac", "ssid", "first_seen", "last_seen", "coalesce(type,'') || ' · ' || coalesce(encryption,'') || ' · ch ' || coalesce(channel,'') || ' · ' || coalesce(manufacturer,'')"),
+        "clients": ("mac", "name", "first_seen", "last_seen", "coalesce(manufacturer,'') || ' · probed: ' || coalesce(probed_ssids,'') || ' · AP: ' || coalesce(connected_ap,'')"),
+        "le": ("mac", "name", "first_seen", "last_seen", "coalesce(category,'') || ' · ' || coalesce(match_reason,'')"),
+        "review": ("mac", "name", "first_seen", "last_seen", "coalesce(status,'') || ' · ' || coalesce(why_might_be,'')"),
+        "decisions": ("mac", "''", "at", "at", "coalesce(from_state,'') || ' → ' || coalesce(to_state,'') || ' · ' || coalesce(why,'')"),
+        "audit": ("mac", "''", "at", "at", "coalesce(action,'') || ' · ' || coalesce(detail,'')"),
+        "sightings": ("mac", "''", "start_at", "end_at", "'polls ' || coalesce(polls,'')"),
+        "overrides": ("mac", "name", "created", "created", "coalesce(actor,'') || ' · ' || coalesce(note,'')"),
+    }
+    ARCHIVE_MAX_ROWS = 5000          # deepest row a combined search pages to (bounded work per request)
+
+    def archive_multi(self, tables, q="", page=0, length=50):
+        keys = list(self.ARCHIVE) if tables == ["all"] else list(dict.fromkeys(tables))
+        if not keys or any(k not in self.ARCHIVE for k in keys):
+            raise KeyError(",".join(tables))
+        length = max(1, min(int(length), 200))
+        page = max(0, int(page))
+        need = (page + 1) * length
+        if need > self.ARCHIVE_MAX_ROWS:
+            raise ValueError("too deep: narrow the search")
+        rows, total, counts = [], 0, {}
+        with self.lock:
+            for key in keys:
+                fname, tname, label, _ = self.ARCHIVE[key]
+                con = self.le if fname in ("law_enforcement.sqlite", "rv") else self.db[fname]
+                cols = [r[1] for r in con.execute(f"PRAGMA {'rv.' if tname.startswith('rv.') else ''}table_info({tname.split('.')[-1]})")]
+                where, args = "", []
+                if q:
+                    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                    text = [c for c in cols if c not in ("id", "polls", "hidden", "randomized_mac", "locked")]
+                    where = " WHERE " + " OR ".join(f'"{c}" LIKE ? ESCAPE \'\\\'' for c in text)
+                    args = [like] * len(text)
+                mac, name, first, last, summ = self.ARCHIVE_SHARED[key]
+                n = con.execute(f"SELECT COUNT(*) FROM {tname}{where}", args).fetchone()[0]
+                counts[key] = n
+                total += n
+                for r in con.execute(f"SELECT {mac}, {name}, {first}, {last}, {summ} FROM {tname}{where} "
+                                     f"ORDER BY {last} DESC, {mac} LIMIT ?", args + [need]):
+                    rows.append([key, label] + ["" if v is None else str(v) for v in r])
+        order = {k: i for i, k in enumerate(self.ARCHIVE)}
+        # Stable: newest first, then source, then MAC. The same MAC in two sources stays two rows (two facts).
+        rows.sort(key=lambda r: (r[5], -order[r[0]], r[2]), reverse=True)
+        return {"tables": {k: v[2] for k, v in self.ARCHIVE.items()}, "selected": keys, "counts": counts,
+                "columns": ["source", "source_label", "mac", "name", "first_seen", "last_seen", "summary"],
+                "rows": rows[page * length: need], "total": total, "page": page, "length": length,
+                "combined": True, "max_rows": self.ARCHIVE_MAX_ROWS}
+
+    def state(self):
+        with self.lock:
+            observed = dict(self.le.execute("SELECT mac, last_epoch FROM rv.observed").fetchall())
+            official = []
+            for r in self.le_rows():
+                r = dict(r)
+                r["kind"] = kind_of(r["match_reason"])
+                r["parent"] = parent_of(r["match_reason"])
+                r["last_observed"] = observed.get(r["mac"])        # epoch seconds, or None = date only
+                official.append(r)
+            cur = self.le.execute("SELECT * FROM rv.review WHERE status='open' ORDER BY last_seen DESC, first_seen DESC")
+            cols = [c[0] for c in cur.description]
+            review = []
+            for row in cur:
+                r = dict(zip(cols, row))
+                r["signals"] = json.loads(r["signals"] or "[]")
+                review.append(r)
+            cur = self.le.execute("SELECT * FROM rv.overrides ORDER BY created DESC")
+            cols = [c[0] for c in cur.description]
+            overrides = [dict(zip(cols, r)) for r in cur]
+            cur = self.le.execute("SELECT id, at, actor, action, mac, detail FROM rv.audit ORDER BY id DESC LIMIT 50")
+            audit = [dict(zip(("id", "at", "actor", "action", "mac", "detail"), r)) for r in cur]
+            cur = self.le.execute("SELECT id, at, mac, action, detail FROM rv.audit WHERE action IN "
+                                  "('resighted','seen-again') ORDER BY id DESC LIMIT 50")
+            notices = [dict(zip(("id", "at", "mac", "action", "detail"), r)) for r in cur]
+            sightings = collections.defaultdict(list)
+            counts = dict(self.le.execute("SELECT mac, COUNT(*) FROM rv.sightings GROUP BY mac").fetchall())
+            for mac, a, b, polls, det in self.le.execute(
+                    "SELECT mac, start_at, end_at, polls, detail FROM rv.sightings ORDER BY id DESC"):
+                if len(sightings[mac]) < 5:
+                    sightings[mac].append({"start": a, "end": b, "polls": polls, "detail": json.loads(det or "{}")})
+            rcols = ("state", "policy", "rule", "observed", "why", "unknown", "decided_at", "decided_by", "locked", "note")
+            res = {r[0]: dict(zip(rcols, r[1:])) for r in self.le.execute(
+                f"SELECT mac, {', '.join(rcols)} FROM rv.resolution")}
+            for r in review:
+                r["sightings"] = sightings.get(r["mac"], [])
+                r["sighting_count"] = counts.get(r["mac"], 0)
+                r["last_observed"] = observed.get(r["mac"])
+                # No decision row = active (new, operator-watched, or not yet evaluated).
+                r["resolution"] = res.get(r["mac"]) or {"state": "active", "rule": "", "policy": REVIEW_POLICY}
+            # Dismissed rows leave the Review list (and every Review badge / filter); they are
+            # published separately so the UI can show them and an operator can reopen them.
+            dismissed = [r for r in review if r["resolution"]["state"] == "dismissed"]
+            review = [r for r in review if r["resolution"]["state"] != "dismissed"]
+            token = self.token()
+        return {"rev": token, "official": official, "review": review, "review_dismissed": dismissed,
+                "review_policy": REVIEW_POLICY, "overrides": overrides, "audit": audit,
+                "notices": notices, "server_time": int(time.time()),
+                "rules": {"version": self.rules.version, "sha256": self.rules.sha}}
+
+
+def epoch(text):
+    """'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' (local time) -> epoch seconds; 0 if unparsable."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text or "", fmt))
+        except ValueError:
+            pass
+    return 0
+
+
+def atomic_write(path, text, mode=0o644):
+    """Write a file so readers see either the old or the new content, never half."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+# --------------------------------------------------------------------------
+# Kismet API
+
+def credentials():
+    conf = dict(line.strip().split("=", 1) for line in CREDS.read_text().splitlines()
+                if "=" in line and not line.lstrip().startswith("#"))
+    raw = f"{conf['httpd_username']}:{conf['httpd_password']}".encode()
+    return "Basic " + base64.b64encode(raw).decode()
+
+
+def refresh_credentials(current):
+    """Follow Kismet password changes without restarting the long-running logger.
+
+    Kismet writes its per-user credential file when /session/set_password succeeds.  Keep the
+    last working credential during an atomic replacement, and retry on the next poll.  Never
+    log either value.
+    """
+    try:
+        fresh = credentials()
+    except (OSError, KeyError, ValueError):
+        return current
+    if fresh != current:
+        Api.auth = fresh
+    return fresh
+
+
+def post_json(auth, path, obj, timeout=60):
+    body = "json=" + json.dumps(obj)
+    req = urllib.request.Request(
+        f"{API}{path}", data=body.encode(),
+        headers={"Authorization": auth, "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def fetch(auth, since):
+    return post_json(auth, f"/devices/last-time/{int(since)}/devices.json", {"fields": FIELDS})
+
+
+def fetch_mac(auth, mac):
+    try:
+        devs = post_json(auth, f"/devices/by-mac/{mac}/devices.json", {"fields": FIELDS}, timeout=20)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    found = merge_by_mac([d for d in (parse(dev) for dev in devs or []) if d["mac"] == mac])
+    return found[0] if found else None
+
+
+KISMET_COOKIE_RE = re.compile(r"(?:^|;\s*)KISMET=([A-Za-z0-9._~+/=-]{8,256})(?:;|$)")
+
+
+def kismet_auth_ok(header, cookie=False):
+    """True if Kismet accepts this credential: an Authorization header, or (cookie=True) the
+    browser's KISMET session cookie value. None if Kismet is down."""
+    hdr = {"Cookie": f"KISMET={header}"} if cookie else {"Authorization": header}
+    req = urllib.request.Request(f"{API}/session/check_session", headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        with e:
+            return False if e.code in (401, 403) else None
+    except (urllib.error.URLError, OSError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# HTTP API for the plugin (port 2502)
+
+class Api(BaseHTTPRequestHandler):
+    logs = None
+    status = None
+    auth = ""
+    protocol_version = "HTTP/1.1"
+    _ok_cache = {}
+    metrics = None
+    sampler = None
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _origin(self):
+        """The Origin to echo, '' if none was sent, or None if it is not allowed."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return ""
+        try:
+            o = urllib.parse.urlsplit(origin)
+            host = urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname
+        except ValueError:
+            return None
+        if o.scheme in ("http", "https") and o.hostname and host and o.hostname == host:
+            return origin
+        return None
+
+    def _send(self, code, obj, origin=""):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self):
+        """Kismet decides: either HTTP Basic (scripts) or the browser's own Kismet session
+        cookie (the Archimet UI). The logger keeps no accounts of its own."""
+        h = self.headers.get("Authorization") or ""
+        m = KISMET_COOKIE_RE.search(self.headers.get("Cookie") or "")
+        if h.startswith("Basic ") and len(h) <= 1024:
+            cred, as_cookie = h, False
+        elif m:
+            cred, as_cookie = m.group(1), True
+        else:
+            return False
+        key = hashlib.sha256((("c:" if as_cookie else "b:") + cred).encode()).hexdigest()
+        hit = self._ok_cache.get(key)
+        if hit and hit > time.time():
+            return True
+        ok = kismet_auth_ok(cred, cookie=as_cookie)
+        if ok is None:
+            raise ConnectionError("kismet unavailable")
+        if ok:
+            if len(self._ok_cache) > 64:
+                self._ok_cache.clear()
+            self._ok_cache[key] = time.time() + 60
+        return ok
+
+    def do_OPTIONS(self):
+        origin = self._origin()
+        if not origin:
+            return self._send(403, {"error": "origin not allowed"})
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Archimet")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        origin = self._origin()
+        if origin is None:
+            return self._send(403, {"error": "origin not allowed"})
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/archimet/health":
+            return self._send(200, {"ok": True, "version": VERSION}, origin)
+        try:
+            if not self._authorized():
+                return self._send(401, {"error": "Kismet login required"}, origin)
+        except ConnectionError:
+            return self._send(503, {"error": "Kismet is not answering"}, origin)
+        if path == "/archimet/le_history.json":
+            with self.logs.lock:
+                return self._send(200, self.logs.history(), origin)
+        if path == "/archimet/archive.json":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            one = lambda k, d="": (q.get(k) or [d])[0]
+            try:
+                if one("tables"):
+                    res = self.logs.archive_multi([t for t in one("tables").split(",") if t][:16], one("q")[:100],
+                                                  int(one("page", "0")), int(one("length", "50")))
+                else:
+                    res = self.logs.archive(one("table", "ap"), one("q")[:100], int(one("page", "0")), int(one("length", "50")),
+                                            one("sort"), one("dir", "desc") != "asc")
+            except (KeyError, ValueError) as e:
+                return self._send(400, {"error": "unknown table or bad paging", "detail": str(e)[:80]}, origin)
+            return self._send(200, res, origin)
+        if path == "/archimet/metrics.json":
+            if not self.metrics:
+                return self._send(503, {"error": "hardware metrics module not installed"}, origin)
+            snap = self.metrics.collect(str(OUT), usage=self.sampler.usage)
+            snap["events"] = self.sampler.history()
+            snap["trend"] = self.sampler.trend_points()   # measured points only, from logger start
+            return self._send(200, snap, origin)
+        if path == "/archimet/state.json":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if q.get("rev", [""])[0] == self.logs.token():
+                return self._send(200, {"rev": self.logs.token(), "unchanged": True,
+                                        "logger": dict(self.status), "updated": ts(None)}, origin)
+            st = self.logs.state()
+            st["logger"] = dict(self.status)
+            st["updated"] = ts(None)
+            return self._send(200, st, origin)
+        return self._send(404, {"error": "not found"}, origin)
+
+    def do_POST(self):
+        origin = self._origin()
+        if origin is None:
+            return self._send(403, {"error": "origin not allowed"})
+        path = urllib.parse.urlsplit(self.path).path
+        if path not in ("/archimet/mark", "/archimet/unmark", "/archimet/review", "/archimet/known.json"):
+            return self._send(404, {"error": "not found"}, origin)
+        # CSRF: a JSON body plus a custom header forces a CORS preflight, which only this
+        # host's own pages pass (_origin). A browser-cookie request must also carry Origin.
+        if self.headers.get("X-Archimet") != "1" or \
+                not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            return self._send(400, {"error": "JSON with X-Archimet: 1 required"}, origin)
+        if not origin and not (self.headers.get("Authorization") or "").startswith("Basic "):
+            return self._send(403, {"error": "Origin required for browser requests"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > (16384 if path == "/archimet/known.json" else 4096):
+            return self._send(413, {"error": "body too large"}, origin)
+        raw = self.rfile.read(n) if n else b""
+        try:
+            if not self._authorized():
+                return self._send(401, {"error": "Kismet login required"}, origin)
+        except ConnectionError:
+            return self._send(503, {"error": "Kismet is not answering"}, origin)
+        try:
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._send(400, {"error": "bad JSON"}, origin)
+        if not isinstance(req, dict):
+            return self._send(400, {"error": "bad JSON"}, origin)
+        if path == "/archimet/known.json":
+            macs = req.get("macs")
+            if not isinstance(macs, list) or len(macs) > 500:
+                return self._send(400, {"error": "macs must be a list of at most 500"}, origin)
+            want = [m for m in (norm_mac(x) for x in macs) if MAC_RE.match(m)]
+            return self._send(200, self.logs.known(want), origin)
+        mac = norm_mac(req.get("mac"))
+        if not MAC_RE.match(mac):
+            return self._send(400, {"error": "mac must be 12 hex digits"}, origin)
+        note = re.sub(r"[\x00-\x1f\x7f]+", " ", str(req.get("note") or "")).strip()
+        action = req.get("action")
+        if path == "/archimet/review" and action not in ("dismiss", "keep", "release"):
+            return self._send(400, {"error": "action must be dismiss, keep or release"}, origin)
+        if (path == "/archimet/mark" or (path == "/archimet/review" and action != "release")) and not (3 <= len(note) <= 500):
+            return self._send(400, {"error": "note must be 3-500 characters"}, origin)
+        if len(note) > 500:
+            return self._send(400, {"error": "note too long"}, origin)
+        ip = self.client_address[0]
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            ip = "?"
+        actor = "an authenticated Kismet UI user"
+        try:
+            if path == "/archimet/mark":
+                res = self.logs.mark(mac, note, actor, ip, lambda m: fetch_mac(self.auth, m))
+            elif path == "/archimet/review":
+                res = self.logs.operator_resolve(mac, action, note, f"{actor} from {ip}")
+            else:
+                res = self.logs.unmark(mac, note, actor, ip)
+        except sqlite3.Error as e:
+            print(f"API write failed for {mac}: {e}", flush=True)
+            return self._send(500, {"error": "database write failed; nothing was changed"}, origin)
+        print(f"API {path.rsplit('/', 1)[1]} {mac} from {ip}: {res}", flush=True)
+        return self._send(200, res, origin)
+
+
+def load_metrics():
+    """Hardware metrics module (archimet_metrics.py, installed beside this script)."""
+    for d in (Path(__file__).resolve().parent, Path(ENV("ARCHIMET_LIB", "/usr/local/lib/archimet"))):
+        if (d / "archimet_metrics.py").exists():
+            sys.path.insert(0, str(d))
+            break
+    try:
+        import archimet_metrics
+    except ImportError:
+        return None, None
+    sampler = archimet_metrics.Sampler(OUT / "hardware_events.json")
+    threading.Thread(target=sampler.run, name="archimet-hw", daemon=True).start()
+    return archimet_metrics, sampler
+
+
+def start_api(logs, status, auth):
+    if HTTP_BIND.lower() == "off":
+        return None
+    host, _, port = HTTP_BIND.rpartition(":")
+    Api.logs, Api.status, Api.auth = logs, status, auth
+    Api.metrics, Api.sampler = load_metrics()
+    srv = ThreadingHTTPServer((host or "0.0.0.0", int(port)), Api)
+    srv.daemon_threads = True
+    t = threading.Thread(target=srv.serve_forever, name="archimet-api", daemon=True)
+    t.start()
+    print(f"Archimet API on {HTTP_BIND}", flush=True)
+    return srv
+
+
+# --------------------------------------------------------------------------
+
+def load_rules_or_keep(current, mtime):
+    """Reload the rules if the file changed. A bad file keeps the last good rules."""
+    try:
+        m = RULES_PATH.stat().st_mtime
+    except OSError:
+        if current is None:
+            print(f"Rules file {RULES_PATH} missing: logging APs/clients only, no LE classification", flush=True)
+            return Rules(), None
+        return current, mtime
+    if current is not None and m == mtime:
+        return current, mtime
+    try:
+        r = Rules.load(RULES_PATH)
+        print(f"Rules {r.version} loaded from {RULES_PATH} ({len(r.prefix)} prefixes)", flush=True)
+        return r, m
+    except (OSError, ValueError, re.error) as exc:
+        print(f"Rules file {RULES_PATH} rejected ({exc}); keeping {current.version if current else 'none'}", flush=True)
+        return current or Rules(), m
+
+
+def run(stop=None):
+    """The service loop. `stop` (a threading.Event) ends it cleanly; the service never sets it."""
+    rules, mtime = load_rules_or_keep(None, None)
+    logs = Logs(rules)
+    auth = credentials()
+    status = {"version": VERSION, "started": ts(None), "poll_seconds": POLL_SECONDS,
+              "last_poll": "", "last_poll_ok": "", "last_poll_ms": 0, "last_poll_devices": 0,
+              "new_device_delay": {}, "events": []}
+    srv = start_api(logs, status, auth)
+    try:
+        _loop(logs, status, auth, mtime, stop)
+    finally:
+        if srv:
+            srv.shutdown()
+            srv.server_close()
+        logs.close()
+
+
+def _loop(logs, status, auth, mtime, stop):
+    delays = collections.deque(maxlen=500)
+    since = 0  # first pass after (re)start: everything Kismet currently knows
+    prev = 0
+    pending = {}       # (MAC, PHY, log role) -> newest record, written to the AP/client logs every LOG_FLUSH_SECONDS
+    flushed = 0
+    print(f"Logging to {OUT} every {POLL_SECONDS:g}s", flush=True)
+    if PUBLIC_HISTORY.exists():
+        print(f"WARNING: {PUBLIC_HISTORY} exists and Kismet serves it without a login; "
+              "LE History is served by the API now, remove the file", flush=True)
+    while not (stop and stop.is_set()):
+        started = time.time()
+        auth = refresh_credentials(auth)
+        rules2, mtime = load_rules_or_keep(logs.rules, mtime)
+        if rules2 is not logs.rules:
+            logs.rules = rules2
+        try:
+            devices = fetch(auth, since)
+            parsed = [d for d in (parse(x) for x in devices) if not quarantined(d, logs.out)]
+            for d in parsed:
+                keep_newer(pending, d)
+            merged = merge_by_mac(parsed)      # one record per MAC for LE / Review
+            flush = started - flushed >= LOG_FLUSH_SECONDS
+            with logs.lock:
+                try:
+                    changed = sum(logs.classify(d) for d in merged)
+                    changed += logs.learn(merged, lambda m: fetch_mac(auth, m))
+                    if started - logs.resolved_at >= REVIEW_RESOLVE_SECONDS:
+                        changed += logs.resolve_review(started)
+                    if flush:
+                        changed += flush_pending(logs, pending)
+                    logs.commit()
+                except Exception:
+                    logs.rollback()
+                    raise
+            if flush:
+                pending.clear()
+                flushed = started
+            now = time.time()
+            if prev:
+                for d in parsed:
+                    if d["first"] and d["first"] > prev - 1:
+                        delays.append(now - d["first"])
+            if delays:
+                s = sorted(delays)
+                status["new_device_delay"] = {"n": len(s), "p50": round(s[len(s) // 2], 2),
+                                              "p95": round(s[int(len(s) * 0.95) - 1 if len(s) > 1 else 0], 2),
+                                              "max": round(s[-1], 2)}
+            status["events"] = [dict(e, delay=round(e["at"] - e["seen"], 2) if e["seen"] else None)
+                                for e in list(logs.events)[-20:]]
+            status.update(last_poll=ts(started), last_poll_ok=ts(now),
+                          last_poll_ms=int((now - started) * 1000), last_poll_devices=len(devices))
+            since = started - OVERLAP
+            prev = started
+            if changed:
+                print(f"{len(devices)} active, {changed} rows written", flush=True)
+        except Exception as exc:  # Kismet restarting, etc. -- retry next round
+            print(f"Poll failed: {exc}", flush=True)
+            status["last_poll"] = ts(started)
+            since = 0      # pending records are kept and written at the next successful flush
+            prev = 0
+        delay = max(0.5, POLL_SECONDS - (time.time() - started))
+        if stop:
+            stop.wait(delay)
+        else:
+            time.sleep(delay)
+
+
+def import_inventory(path):
+    rules, _ = load_rules_or_keep(None, None)
+    logs = Logs(rules)
+    src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    n = changed = 0
+    for mac, first, last, blob in src.execute(
+            "SELECT mac, first_seen, last_seen, latest_json FROM inventory"):
+        try:
+            dev = json.loads(blob or "{}")
+        except ValueError:
+            continue
+        d = parse(dev)
+        d["mac"] = d["mac"] or (mac or "").upper()
+        d["first"] = first or d["first"]
+        d["last"] = last or d["last"]
+        changed += logs.record(d)
+        n += 1
+    logs.commit()
+    logs.close()
+    src.close()
+    print(f"Imported {n} devices ({changed} rows written)")
+
+
+# --------------------------------------------------------------------------
+# One-time migration of pre-Archimet LE rows
+
+def migrate(confirm_macs, confirm_note, dry_run=False):
+    rules, _ = load_rules_or_keep(None, None)
+    if not rules.prefix:
+        sys.exit("refusing to migrate without a valid rules file")
+    logs = Logs(rules)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    report = {"run": run_id, "before": {}, "after": {}, "actions": []}
+    le = logs.le
+    rows = logs.le_rows()
+    report["before"] = {"le_rows": len(rows),
+                        "review_rows": le.execute("SELECT COUNT(*) FROM rv.review").fetchone()[0],
+                        "by_kind": dict(collections.Counter(kind_of(r["match_reason"]) for r in rows))}
+    now = ts(None)
+
+    def log(mac, action, before, after):
+        report["actions"].append({"mac": mac, "action": action,
+                                  "before": before and before["match_reason"],
+                                  "after": after and after.get("match_reason", after.get("why_might_be"))})
+        le.execute("INSERT INTO rv.migration (at, run, mac, action, before_json, after_json) VALUES (?,?,?,?,?,?)",
+                   (now, run_id, mac, action, json.dumps(before), json.dumps(after)))
+
+    try:
+        for r in rows:
+            k = kind_of(r["match_reason"])
+            if k in ("hardware", "operator", "learned") and r["match_reason"].split(":", 1)[0] in ("Hardware", "Operator", "Learned"):
+                continue   # already in the new format
+            d = {"mac": r["mac"], "type": r["type"] or "", "name": r["name"] or "", "ssid": r["name"] or "",
+                 "manuf": r["manufacturer"] or "", "crypt": r["encryption"] or "",
+                 "phy": "BTLE" if r["radio"] == "Bluetooth" else "IEEE802.11",
+                 "first": 0, "last": 0, "uuids": []}
+            sigs = rules.signals(d)
+            hw, reason = rules.hardware(sigs)
+            if hw and k == "hardware":
+                after = dict(r, category=rules.log_category(hw["category"]), match_reason=reason)
+                le.execute("UPDATE law_enforcement SET category=?, match_reason=? WHERE mac=?",
+                           (after["category"], reason, r["mac"]))
+                log(r["mac"], "hardware-reason-rewritten", r, after)
+                continue
+            if r["mac"] in confirm_macs and k == "hardware":
+                fleet = [s for s in sigs if s["class"] == "fleet"]
+                ev = "; ".join(f"{s['detail']} (fleet vendor: also sold for non-police use)" for s in fleet) or r["match_reason"]
+                reason = (f"Operator: confirmed by the operator (migration {run_id}). Note: {confirm_note} "
+                          f"| Hardware evidence: {ev}")
+                le.execute("INSERT OR REPLACE INTO rv.overrides (mac, note, actor, source_ip, created, name, manufacturer, radio, type)"
+                           " VALUES (?,?,?,?,?,?,?,?,?)",
+                           (r["mac"], confirm_note, "migration", "local", now, r["name"], r["manufacturer"], r["radio"], r["type"]))
+                after = dict(r, match_reason=reason)
+                le.execute("UPDATE law_enforcement SET match_reason=? WHERE mac=?", (reason, r["mac"]))
+                log(r["mac"], "operator-confirmed", r, after)
+                continue
+            # Keyword-only rows, and hardware rows the new rules no longer accept.
+            review = [s for s in sigs if s["class"] in ("fleet", "name", "laa", "agency")]
+            review.append({"kind": "legacy-le-row", "class": "legacy",
+                           "detail": f"was in law_enforcement.sqlite as “{r['category']}”: {r['match_reason']}"})
+            d["first"] = time.mktime(time.strptime(r["first_seen"], "%Y-%m-%d %H:%M:%S")) if r["first_seen"] else 0
+            d["last"] = time.mktime(time.strptime(r["last_seen"], "%Y-%m-%d")) if r["last_seen"] else 0
+            logs.review_upsert(d, review, source="migration")
+            rv = logs._get("rv", "rv.review", r["mac"])
+            le.execute("UPDATE rv.review SET status='open', first_seen=?, last_seen=? WHERE mac=?",
+                       (min(rv["first_seen"], r["first_seen"] or rv["first_seen"]), r["last_seen"] or rv["last_seen"], r["mac"]))
+            le.execute("DELETE FROM law_enforcement WHERE mac=?", (r["mac"],))
+            log(r["mac"], "moved-to-review", r, logs._get("rv", "rv.review", r["mac"]))
+        rows2 = logs.le_rows()
+        report["after"] = {"le_rows": len(rows2),
+                           "review_rows": le.execute("SELECT COUNT(*) FROM rv.review").fetchone()[0],
+                           "by_kind": dict(collections.Counter(kind_of(r["match_reason"]) for r in rows2))}
+        if dry_run:
+            logs.rollback()
+            report["dry_run"] = True
+        else:
+            logs.le_dirty = True
+            logs.commit()
+    except Exception:
+        logs.rollback()
+        raise
+    finally:
+        logs.close()
+    print(json.dumps(report, indent=1))
+    return report
+
+
+def rollback_migration(run_id=None):
+    logs = Logs(Rules())
+    le = logs.le
+    q = "SELECT id, run, mac, action, before_json, after_json FROM rv.migration WHERE reverted IS NULL"
+    args = ()
+    if run_id:
+        q += " AND run=?"
+        args = (run_id,)
+    rows = le.execute(q + " ORDER BY id DESC", args).fetchall()
+    try:
+        for mid, run, mac, action, before, after in rows:
+            b = json.loads(before)
+            cols = ", ".join(b)
+            le.execute(f"INSERT OR REPLACE INTO law_enforcement ({cols}) VALUES ({', '.join('?' * len(b))})", list(b.values()))
+            if action == "moved-to-review":
+                le.execute("DELETE FROM rv.review WHERE mac=? AND source='migration'", (mac,))
+            if action == "operator-confirmed":
+                le.execute("DELETE FROM rv.overrides WHERE mac=? AND actor='migration'", (mac,))
+            le.execute("UPDATE rv.migration SET reverted=? WHERE id=?", (ts(None), mid))
+        logs.le_dirty = True
+        logs.commit()
+    except Exception:
+        logs.rollback()
+        raise
+    finally:
+        logs.close()
+    print(f"Reverted {len(rows)} migration actions")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--import-inventory", metavar="PATH")
+    ap.add_argument("--migrate", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--confirm-operator", default="", help="comma-separated MACs carried over as Operator rows")
+    ap.add_argument("--confirm-note", default="")
+    ap.add_argument("--rollback-migration", nargs="?", const="", metavar="RUN")
+    ap.add_argument("--check-rules", metavar="PATH")
+    ap.add_argument("--repair-unmarked", action="store_true", help="put earlier unmarked devices into Review (watched)")
+    ap.add_argument("--refresh-review-notes", action="store_true", help="recompute Review notes from their signals")
+    ap.add_argument("--audit-learned", action="store_true", help="move Learned rows without data-frame evidence to Review")
+    args = ap.parse_args()
+    if args.check_rules:
+        r = Rules.load(args.check_rules)
+        print(f"ok {r.version} sha256={r.sha} prefixes={len(r.prefix)} names={len(r.names)}")
+    elif args.repair_unmarked:
+        rules, _ = load_rules_or_keep(None, None)
+        print(f"{Logs(rules).repair_unmarked()} unmarked devices put back into Review (watched)")
+    elif args.audit_learned:
+        rules, _ = load_rules_or_keep(None, None)
+        moved = Logs(rules).audit_learned()
+        print(f"{len(moved)} Learned rows without data-frame evidence moved to Review: {moved}")
+    elif args.refresh_review_notes:
+        rules, _ = load_rules_or_keep(None, None)
+        print(f"{Logs(rules).refresh_review_notes()} Review rows' notes refreshed")
+    elif args.import_inventory:
+        import_inventory(args.import_inventory)
+    elif args.migrate:
+        macs = {norm_mac(m) for m in args.confirm_operator.split(",") if m.strip()}
+        if macs and not args.confirm_note.strip():
+            sys.exit("--confirm-operator needs --confirm-note")
+        migrate(macs, args.confirm_note.strip(), args.dry_run)
+    elif args.rollback_migration is not None:
+        rollback_migration(args.rollback_migration or None)
+    else:
+        run()

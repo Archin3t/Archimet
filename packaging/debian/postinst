@@ -1,0 +1,121 @@
+#!/bin/sh
+# archimet postinst. Archimet runs ON the upstream Kismet packages (kismet-core and the Linux Wi-Fi /
+# Bluetooth capture helpers, exact tested versions). It never modifies files those packages own.
+# Never touches: NetworkManager, hotspot profiles, capture-source definitions (kismet_site.conf),
+# credentials, or any data file contents.
+set -e
+
+DEFAULT=/etc/default/archimet
+
+# Which account runs Kismet and the logger: the existing setting; else the account kismet.service
+# already runs as (an admin drop-in); else a new system account.
+choose_user() {
+    if [ -f "$DEFAULT" ]; then
+        u=$(sed -n 's/^ARCHIMET_USER=//p' "$DEFAULT" | tail -1)
+        [ -n "$u" ] && { echo "$u"; return; }
+    fi
+    old=$(sed -n 's/^User=//p' /etc/systemd/system/kismet.service.d/*.conf 2>/dev/null | grep -v '^root$' | tail -1)
+    if [ -n "$old" ] && getent passwd "$old" >/dev/null; then echo "$old"; return; fi
+    echo archimet
+}
+
+# Bring an older /etc/default/archimet to the gateway layout without touching other settings:
+# Kismet and the logger move to loopback (2500 / 2502); the gateway takes 2501.
+upgrade_defaults() {
+    grep -q '^# archimet-defaults v2' "$DEFAULT" && return 0
+    sed -i -e 's#^ARCHIMET_API=http://127.0.0.1:2501$#ARCHIMET_API=http://127.0.0.1:2500#' "$DEFAULT"
+    grep -q '^ARCHIMET_HTTP=' "$DEFAULT" || echo 'ARCHIMET_HTTP=127.0.0.1:2502' >> "$DEFAULT"
+    grep -q '^ARCHIMET_GATEWAY_BIND=' "$DEFAULT" || echo 'ARCHIMET_GATEWAY_BIND=0.0.0.0:2501' >> "$DEFAULT"
+    grep -q '^ARCHIMET_KISMET_URL=' "$DEFAULT" || echo 'ARCHIMET_KISMET_URL=http://127.0.0.1:2500' >> "$DEFAULT"
+    grep -q '^ARCHIMET_LOGGER_URL=' "$DEFAULT" || echo 'ARCHIMET_LOGGER_URL=http://127.0.0.1:2502' >> "$DEFAULT"
+    sed -i '1a # archimet-defaults v2 (gateway layout)' "$DEFAULT"
+}
+
+case "$1" in
+configure)
+    U=$(choose_user)
+    if ! getent passwd "$U" >/dev/null; then
+        adduser --system --group --home /var/lib/archimet --shell /usr/sbin/nologin "$U" >/dev/null
+    fi
+    HOME_DIR=$(getent passwd "$U" | cut -d: -f6)
+    getent group kismet >/dev/null || addgroup --quiet --system kismet
+    adduser --quiet "$U" kismet >/dev/null 2>&1 || true
+
+    if [ ! -f "$DEFAULT" ]; then
+        if [ -d "$HOME_DIR/kismet-logs" ]; then OUT="$HOME_DIR/kismet-logs"; else OUT="$HOME_DIR/archimet-logs"; fi
+        umask 022
+        cat > "$DEFAULT" <<EOF
+# Archimet runtime settings, written once by the archimet package. Edit freely; upgrades keep it.
+# archimet-defaults v2 (gateway layout)
+ARCHIMET_USER=$U
+ARCHIMET_OUT=$OUT
+ARCHIMET_CREDS=$HOME_DIR/.kismet/kismet_httpd.conf
+ARCHIMET_RULES=/usr/share/archimet/le_rules.json
+ARCHIMET_LIB=/usr/lib/archimet
+ARCHIMET_API=http://127.0.0.1:2500
+ARCHIMET_HTTP=127.0.0.1:2502
+ARCHIMET_GATEWAY_BIND=0.0.0.0:2501
+ARCHIMET_KISMET_URL=http://127.0.0.1:2500
+ARCHIMET_LOGGER_URL=http://127.0.0.1:2502
+EOF
+    else
+        upgrade_defaults
+    fi
+    OUT=$(sed -n 's/^ARCHIMET_OUT=//p' "$DEFAULT" | tail -1)
+    [ -n "$OUT" ] && [ ! -d "$OUT" ] && install -d -o "$U" -g "$U" -m 750 "$OUT"
+
+    # The account (Kismet's own login, one user). Fresh install only: archimet / archimet, which the
+    # gateway treats as SETUP: loopback-only, no data, until the password is changed (server side).
+    # An existing account is never touched.
+    CREDS=$(sed -n 's/^ARCHIMET_CREDS=//p' "$DEFAULT" | tail -1)
+    FRESH=0
+    if [ -n "$CREDS" ] && ! grep -qs '^httpd_password=.' "$CREDS"; then
+        install -d -o "$U" -g "$U" -m 700 "$(dirname "$CREDS")"
+        [ -f "$CREDS" ] && sed -i '/^httpd_username=/d' "$CREDS"      # a user name without a password is no account
+        (umask 077; printf 'httpd_username=archimet\nhttpd_password=archimet\n' >> "$CREDS")
+        chown "$U:$U" "$CREDS"; chmod 600 "$CREDS"
+        FRESH=1
+    fi
+    rm -f /etc/archimet/setup-code                                    # 5.3.0 pre-release first-run code, replaced
+
+    # Local HTTPS (offline CA + this Pi's certificate). Network access needs it; created once, kept on upgrade.
+    if [ ! -s /etc/archimet/tls/server.crt ]; then
+        /usr/lib/archimet/archimet-tls init >/dev/null 2>&1 || echo "archimet: HTTPS setup failed; run: sudo archimet-tls init"
+    fi
+
+    # The account kismet.service and the logger run as (admin-owned drop-ins, regenerated each time).
+    install -d -m 755 /etc/systemd/system/kismet.service.d /etc/systemd/system/archimet-logger.service.d
+    printf '[Service]\nUser=%s\nGroup=kismet\n' "$U" > /etc/systemd/system/kismet.service.d/10-archimet-user.conf
+    printf '[Service]\nUser=%s\nGroup=kismet\n' "$U" > /etc/systemd/system/archimet-logger.service.d/10-user.conf
+    # Leftovers of Archimet 5.2 (which bundled the engine) and of the pre-package setup.
+    rm -rf /etc/systemd/system/archimet-engine.service.d
+    if [ -f /etc/systemd/system/kismet.service.d/override.conf ] && \
+       grep -qx "User=$U" /etc/systemd/system/kismet.service.d/override.conf; then
+        rm -f /etc/systemd/system/kismet.service.d/override.conf     # same account, now in 10-archimet-user.conf
+    fi
+    if [ "$(systemctl is-enabled kismet-device-logger.service 2>/dev/null || true)" = enabled ]; then
+        systemctl disable --now kismet-device-logger.service >/dev/null 2>&1 || true
+        echo "archimet: disabled the pre-package kismet-device-logger.service (replaced by archimet-logger)"
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable kismet.service archimet-logger.service archimet-gateway.service >/dev/null 2>&1 || true
+        systemctl restart kismet.service
+        systemctl restart archimet-logger.service
+        systemctl restart archimet-gateway.service
+        # Hold the tested Kismet packages once dpkg has finished (apt-mark cannot run inside dpkg).
+        systemd-run --quiet --unit=archimet-hold-apply --on-active=20 /usr/lib/archimet/archimet-hold apply >/dev/null 2>&1 \
+            || echo "archimet: run 'sudo archimet-hold apply' to hold the tested Kismet packages"
+    fi
+    echo "archimet: running as $U; data in $OUT"
+    if [ "$FRESH" = 1 ]; then
+        echo "archimet: first setup: from this Pi or through 'ssh -L 2501:127.0.0.1:2501 <user>@<pi>', open"
+        echo "          https://localhost:2501/ , sign in as archimet / archimet and choose a new password."
+        echo "          Until then Archimet is closed to the network. Guide: /usr/share/doc/archimet/INSTALL.md"
+    else
+        echo "archimet: open https://<this Pi>:2501/ (trust the local CA once: /usr/share/doc/archimet/HTTPS.md)"
+    fi
+    ;;
+esac
+exit 0

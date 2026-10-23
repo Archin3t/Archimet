@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Archimet setup helper. Hotspot setup is OPTIONAL: nothing here changes anything unless asked.
+
+    archimet-setup detect                         report radios: capture sources, hotspot radios, free radios
+    archimet-setup hotspot status
+    archimet-setup hotspot enable --iface wlan2 --ssid NAME [--band a|bg] [--address 10.10.0.1/24] [--dry-run]
+                                                  (run as root; the WPA2 password is read from stdin)
+    archimet-setup hotspot disable [--dry-run]
+
+Rules:
+  * Only the profile Archimet creates ("Archimet Hotspot", keyfile archimet-hotspot.nmconnection) is ever
+    changed or deleted. Any other NetworkManager profile (for example an existing "Wardriving AP") is
+    reported and left alone.
+  * A radio that is a Kismet capture source, or already used by another access-point profile, is refused
+    for the hotspot. Archimet never puts a hotspot radio into monitor mode or captures on it.
+  * The password goes into a mode-600 NetworkManager keyfile and is never a process argument.
+  * The chosen interface is recorded in /etc/archimet/hotspot.conf, so Archimet treats it as reserved.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+PROFILE = "Archimet Hotspot"
+SITE = Path(os.environ.get("ARCHIMET_SITE", "/etc/kismet/kismet_site.conf"))
+OVERRIDE = Path(os.environ.get("ARCHIMET_ENGINE_CONF", "/etc/archimet/kismet-archimet.conf"))
+HOTSPOT_CONF = Path(os.environ.get("ARCHIMET_HOTSPOT_CONF", "/etc/archimet/hotspot.conf"))
+KEYFILE = Path(os.environ.get("ARCHIMET_NM_KEYFILE", "/etc/NetworkManager/system-connections/archimet-hotspot.nmconnection"))
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+SSID_RE = re.compile(r"^[\x20-\x3a\x3c-\x5b\x5d-\x7e]{1,32}$")      # printable ASCII without ';' and '\'
+ADDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def nm_profiles():
+    """[{name, type, device, mode, iface}] for every NetworkManager profile (no secrets)."""
+    out = []
+    for line in run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "con", "show"]).splitlines():
+        parts = re.split(r"(?<!\\):", line)
+        if len(parts) < 3:
+            continue
+        name = parts[0].replace("\\:", ":")
+        p = {"name": name, "type": parts[1], "device": parts[2], "mode": "", "iface": ""}
+        if parts[1] == "802-11-wireless":
+            g = run(["nmcli", "-g", "802-11-wireless.mode,connection.interface-name", "con", "show", name]).splitlines()
+            p["mode"], p["iface"] = (g + ["", ""])[:2]
+        out.append(p)
+    return out
+
+
+def capture_sources(*texts):
+    """Interfaces named in source= lines (Kismet's site config, Archimet's engine config)."""
+    return sorted({m.group(1) for t in texts for m in re.finditer(r"^\s*source\s*=\s*([^:\s]+)", t or "", re.M)})
+
+
+def wifi_ifaces():
+    return sorted(p.name for p in Path("/sys/class/net").glob("*") if (p / "wireless").exists() or (p / "phy80211").exists())
+
+
+def classify(ifaces, sources, profiles):
+    """-> {iface: (role, why)} with role "capture" | "hotspot" | "free"."""
+    ap = {p["iface"] or p["device"]: p["name"] for p in profiles if p["mode"] == "ap" and (p["iface"] or p["device"])}
+    out = {}
+    for i in ifaces:
+        if i in sources:
+            out[i] = ("capture", "a Kismet capture source")
+        elif i in ap:
+            out[i] = ("hotspot", f"used by access-point profile “{ap[i]}”; reserved, never captured on")
+        else:
+            out[i] = ("free", "not a source and not used by a hotspot profile")
+    return out
+
+
+def validate(iface, ssid, band, address, roles, profiles):
+    """Raises ValueError with the reason when the hotspot must not be created this way."""
+    if not IFACE_RE.match(iface or ""):
+        raise ValueError("bad interface name")
+    if iface not in roles:
+        raise ValueError(f"{iface} is not a Wi-Fi interface on this Pi")
+    role, why = roles[iface]
+    if role == "capture":
+        raise ValueError(f"{iface} is {why}; a capture radio cannot also be the hotspot")
+    if role == "hotspot" and not any(p["name"] == PROFILE for p in profiles):
+        raise ValueError(f"{iface} is {why}; Archimet leaves that profile alone")
+    if not SSID_RE.match(ssid or "") or ssid != ssid.strip():
+        raise ValueError("SSID: 1-32 printable characters, no ';' or backslash, no leading or trailing spaces")
+    if band not in ("a", "bg"):
+        raise ValueError("band must be a (5 GHz) or bg (2.4 GHz)")
+    if not ADDR_RE.match(address or ""):
+        raise ValueError("address must look like 10.10.0.1/24")
+
+
+def keyfile(iface, ssid, band, address, psk, conn_uuid):
+    """NetworkManager keyfile for the Archimet hotspot (written mode 600, loaded with nmcli)."""
+    if not 8 <= len(psk) <= 63 or any(ord(c) < 32 or ord(c) > 126 for c in psk):
+        raise ValueError("WPA2 password: 8-63 printable ASCII characters")
+    return (f"[connection]\nid={PROFILE}\nuuid={conn_uuid}\ntype=wifi\ninterface-name={iface}\nautoconnect=true\n\n"
+            f"[wifi]\nmode=ap\nssid={ssid}\nband={band}\n\n"
+            f"[wifi-security]\nkey-mgmt=wpa-psk\nproto=rsn;\npairwise=ccmp;\ngroup=ccmp;\npsk={psk}\n\n"
+            f"[ipv4]\nmethod=shared\naddress1={address}\n\n[ipv6]\nmethod=disabled\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("detect")
+    hp = sub.add_parser("hotspot")
+    hp.add_argument("action", choices=("status", "enable", "disable"))
+    hp.add_argument("--iface")
+    hp.add_argument("--ssid")
+    hp.add_argument("--band", default="a")
+    hp.add_argument("--address", default="10.10.0.1/24")
+    hp.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    site = SITE.read_text() if SITE.exists() else ""
+    over = OVERRIDE.read_text() if OVERRIDE.exists() else ""
+    profiles = nm_profiles()
+    roles = classify(wifi_ifaces(), capture_sources(site, over), profiles)
+    if a.cmd == "detect":
+        print(json.dumps({"radios": {i: {"role": r, "why": w} for i, (r, w) in roles.items()},
+                          "access_point_profiles": [p["name"] for p in profiles if p["mode"] == "ap"],
+                          "archimet_hotspot": HOTSPOT_CONF.read_text().strip() if HOTSPOT_CONF.exists() else "off"}, indent=1))
+        return
+    mine = [p for p in profiles if p["name"] == PROFILE]
+    if a.action == "status":
+        print("Archimet hotspot: " + (f"configured on {mine[0]['iface'] or '?'}" + (" (active)" if mine[0]["device"] else " (inactive)") if mine else "off (not configured)"))
+        others = [p["name"] for p in profiles if p["mode"] == "ap" and p["name"] != PROFILE]
+        if others:
+            print("Other access-point profiles (never changed by Archimet): " + ", ".join(others))
+        return
+    if a.action == "disable":
+        if not mine:
+            print("Archimet hotspot is not configured; nothing to do.")
+            return
+        cmds = [["nmcli", "con", "down", PROFILE], ["nmcli", "con", "delete", PROFILE]]   # deletes only its own keyfile
+        if a.dry_run:
+            print("\n".join(" ".join(c) for c in cmds))
+            return
+        for c in cmds:
+            subprocess.run(c, check=False)
+        HOTSPOT_CONF.unlink(missing_ok=True)
+        print("Archimet hotspot removed. Other profiles were not touched.")
+        return
+    if not (a.iface and a.ssid):
+        sys.exit("enable needs --iface and --ssid")
+    try:
+        validate(a.iface, a.ssid, a.band, a.address, roles, profiles)
+    except ValueError as e:
+        sys.exit(f"REFUSED: {e}")
+    if a.dry_run:
+        print(f"write {KEYFILE} (mode 600): profile “{PROFILE}”, {a.iface}, AP mode, SSID “{a.ssid}”, band {a.band}, "
+              f"{a.address} shared, WPA2-PSK (password from stdin)\nnmcli connection load {KEYFILE}\nnmcli connection up {PROFILE}")
+        return
+    try:
+        text = keyfile(a.iface, a.ssid, a.band, a.address, sys.stdin.readline().rstrip("\n"), str(uuid.uuid4()))
+    except ValueError as e:
+        sys.exit(f"REFUSED: {e}")
+    fd = os.open(KEYFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    subprocess.run(["nmcli", "connection", "load", str(KEYFILE)], check=True)
+    subprocess.run(["nmcli", "connection", "up", PROFILE], check=False)
+    HOTSPOT_CONF.parent.mkdir(parents=True, exist_ok=True)
+    HOTSPOT_CONF.write_text(a.iface + "\n")
+    print(f"Archimet hotspot “{a.ssid}” on {a.iface}. Turn it off with: archimet-setup hotspot disable")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Archimet / Kismet compatibility check, for use before and after a Kismet update.
+
+    archimet-compat [--contract /usr/local/share/archimet/www/js/api/contract.json] [--json]
+
+Runs on the Pi with Kismet's own credentials (read from ~/.kismet/kismet_httpd.conf, never
+printed). Checks every endpoint and field in Archimet's contract (the same file the UI's
+"Check now" uses), plus the behaviours Archimet depends on:
+  * paging and field selection are honoured (an ignored form returns every device in full),
+  * sort_dir semantics (Kismet 2025.09 inverts asc/desc; Archimet compensates),
+  * lookup by MAC with literal colons,
+  * the logger API (health, authenticated state/known/metrics),
+  * the logger version against the contract's logger.min_version (fails closed if either is missing).
+Exit status 0 = all checks pass; 1 = at least one failed (do not switch the UI on).
+
+    archimet-compat --logger-version-only [--contract ...]   only the logger version gate
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+def _defaults(path="/etc/default/archimet"):
+    """The installed settings (Kismet's private port etc.), so the check needs no arguments."""
+    out = {}
+    try:
+        for line in open(path):
+            m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
+            if m:
+                out[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return out
+
+
+_D = _defaults()
+KISMET = os.environ.get("ARCHIMET_API") or _D.get("ARCHIMET_API") or "http://127.0.0.1:2500"
+# The environment wins over the installed settings; ARCHIMET_LOGGER is the older name.
+LOGGER = (os.environ.get("ARCHIMET_LOGGER_URL") or os.environ.get("ARCHIMET_LOGGER") or _D.get("ARCHIMET_LOGGER_URL")
+          or "http://127.0.0.1:2502")
+CREDS = os.environ.get("ARCHIMET_CREDS") or _D.get("ARCHIMET_CREDS") or os.path.expanduser("~/.kismet/kismet_httpd.conf")
+
+
+def auth():
+    conf = open(CREDS).read()
+    u = re.search(r"^httpd_username=(.*)$", conf, re.M).group(1).strip()
+    p = re.search(r"^httpd_password=(.*)$", conf, re.M).group(1).strip()
+    return "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+
+
+def call(base, path, form=None, a=None):
+    data = urllib.parse.urlencode(form).encode() if form is not None else None
+    req = urllib.request.Request(base + path, data=data, headers={"Authorization": a} if a else {})
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            try:
+                return r.status, json.loads(raw)
+            except ValueError:
+                return r.status, raw.decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, None
+    except OSError as e:
+        return 0, str(e)
+
+
+def check_entry(e, status, body):
+    """Same rules as ui/js/api/compat.js check()."""
+    if status != 200:
+        return [f"HTTP {status or 'no answer'}"]
+    if e.get("text"):
+        return []
+    miss = []
+    if e.get("list") and not isinstance(body, list):
+        return ["expected a list"]
+    for k in e.get("requires", []):
+        if not isinstance(body, dict) or k not in body:
+            miss.append(k)
+    if e.get("item") and isinstance(body, (dict, list)):
+        item = body
+        for k in e["item"]:
+            try:
+                item = item[k]
+            except (KeyError, IndexError, TypeError):
+                item = None
+                break
+        if isinstance(item, dict):
+            miss += [k for k in e.get("item_requires", []) if k not in item]
+    if e.get("max_items") and isinstance(body, dict):
+        arr = body.get(e["max_items"][0])
+        if isinstance(arr, list) and len(arr) > e["max_items"][1]:
+            miss.append(f"paging ignored ({len(arr)} items)")
+        if isinstance(arr, list) and arr and e.get("max_fields") and len(arr[0]) > e["max_fields"]:
+            miss.append("field list ignored")
+    if e.get("list") and isinstance(body, list) and body:
+        miss += [k for k in e.get("item_requires_if_any", []) if k not in body[0]]
+    return miss
+
+
+def logger_version(s, name="archimet-logger"):
+    """'archimet-logger 5.2.0' -> (5, 2, 0); anything else -> None."""
+    m = re.fullmatch(r"(\S+) (\d+)\.(\d+)\.(\d+)", s.strip()) if isinstance(s, str) else None
+    return tuple(int(x) for x in m.groups()[1:]) if m and m.group(1) == name else None
+
+
+def check_logger_version(spec, status, body):
+    """Same rules as ui/js/api/compat.js checkLogger(). Fails closed: no minimum in the
+    contract, no answer, or no parseable version is a failure."""
+    spec = spec if isinstance(spec, dict) else {}
+    name = spec.get("name") or ""
+    want = logger_version(f'{name} {spec.get("min_version") or ""}', name) if name else None
+    if not want:
+        return ["contract has no logger minimum version"]
+    if status != 200:
+        return [f"HTTP {status or 'no answer'}"]
+    have = logger_version(body.get("version"), name) if isinstance(body, dict) else None
+    if not have:
+        return ["logger reports no version"]
+    if have < want:
+        return [f"logger {'.'.join(map(str, have))} older than {spec['min_version']}"]
+    return []
+
+
+def logger_version_result(contract):
+    st, h = call(LOGGER, (contract.get("logger") or {}).get("path") or "/archimet/health")
+    miss = check_logger_version(contract.get("logger"), st, h)
+    return {"id": "logger_version", "ok": not miss, "missing": miss,
+            "version": h.get("version") if isinstance(h, dict) else None}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    # The package installs the web root in /usr/share/archimet/www; the pre-package deploy used /usr/local.
+    default = next((p for p in ("/usr/share/archimet/www/js/api/contract.json", "/usr/local/share/archimet/www/js/api/contract.json")
+                    if os.path.exists(p)), "/usr/share/archimet/www/js/api/contract.json")
+    ap.add_argument("--contract", default=default)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--logger-version-only", action="store_true",
+                    help="only check the running logger against contract.logger.min_version (no credentials needed)")
+    ap.add_argument("--kismet-only", action="store_true",
+                    help="only the Kismet checks (deployment preflight, before the new logger is installed)")
+    a = ap.parse_args()
+    contract = json.load(open(a.contract))
+    if a.logger_version_only:
+        r = logger_version_result(contract)
+        print(json.dumps(r, indent=1) if a.json else
+              f"{'ok ' if r['ok'] else '!! '} logger_version {r['version'] or ''}{'' if r['ok'] else '  ' + ', '.join(r['missing'])}")
+        sys.exit(0 if r["ok"] else 1)
+    A = auth()
+    results = []
+    for e in contract["endpoints"]:
+        st, body = call(KISMET, e["path"], e.get("form") if e["method"] == "POST" else None, A)
+        miss = check_entry(e, st, body)
+        results.append({"id": e["id"], "ok": not miss, "missing": miss})
+    # sort_dir: Archimet sends "asc" for newest-first on Kismet 2025.09.
+    st, body = call(KISMET, "/devices/views/all/devices.json", {"json": json.dumps({"fields": ["kismet.device.base.last_time"]}),
+                    "page": 0, "length": 5, "sort": "kismet.device.base.last_time", "sort_dir": "asc"}, A)
+    t = [d.get("kismet.device.base.last_time", 0) for d in (body or {}).get("data", [])] if st == 200 else []
+    results.append({"id": "sort_dir", "ok": st == 200 and all(t[i - 1] >= t[i] for i in range(1, len(t))),
+                    "missing": [] if st == 200 else [f"HTTP {st}"]})
+    # by-mac with literal colons.
+    st, one = call(KISMET, "/devices/views/all/devices.json", {"json": json.dumps({"fields": ["kismet.device.base.macaddr"]}), "page": 0, "length": 1}, A)
+    mac = ((one or {}).get("data") or [{}])[0].get("kismet.device.base.macaddr") if st == 200 else None
+    if mac:
+        st2, found = call(KISMET, f"/devices/by-mac/{mac}/devices.json", {"json": json.dumps({"fields": ["kismet.device.base.key"]})}, A)
+        results.append({"id": "by_mac", "ok": st2 == 200 and isinstance(found, list) and len(found) > 0, "missing": [] if st2 == 200 else [f"HTTP {st2}"]})
+    if a.kismet_only:
+        ok = all(r["ok"] for r in results)
+        for r in results:
+            print(f"{'ok ' if r['ok'] else '!! '} {r['id']}{'' if r['ok'] else '  ' + ', '.join(r['missing'])}")
+        print(f"{'PASS' if ok else 'FAIL'}: Kismet {sum(r['ok'] for r in results)}/{len(results)} (logger not checked)")
+        sys.exit(0 if ok else 1)
+    # Logger API.
+    st, h = call(LOGGER, "/archimet/health")
+    results.append({"id": "logger_health", "ok": st == 200 and isinstance(h, dict) and h.get("ok"), "missing": [] if st == 200 else [f"HTTP {st}"],
+                    "version": (h or {}).get("version") if isinstance(h, dict) else None})
+    results.append(logger_version_result(contract))
+    for path in ("/archimet/state.json", "/archimet/metrics.json"):
+        st, _ = call(LOGGER, path, None, A)
+        results.append({"id": "logger" + path.replace("/archimet/", "_").replace(".json", ""), "ok": st == 200, "missing": [] if st == 200 else [f"HTTP {st}"]})
+    st, _ = call(LOGGER, "/archimet/state.json")
+    results.append({"id": "logger_requires_auth", "ok": st == 401, "missing": [] if st == 401 else [f"anonymous got HTTP {st}"]})
+    ok = all(r["ok"] for r in results)
+    if a.json:
+        print(json.dumps({"tested_with": contract.get("tested_with"), "ok": ok, "results": results}, indent=1))
+    else:
+        for r in results:
+            print(f"{'ok ' if r['ok'] else '!! '} {r['id']}{'' if r['ok'] else '  ' + ', '.join(r['missing'])}")
+        print(f"{'PASS' if ok else 'FAIL'}: {sum(r['ok'] for r in results)}/{len(results)} (contract written for {contract.get('tested_with')})")
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Keep the Kismet engine at the version this Archimet release was tested with.
+#   archimet-hold apply     hold kismet-core and the two capture helpers (only at the tested version)
+#   archimet-hold status    installed vs tested versions, hold state, apt candidate (newer releases)
+#   archimet-hold release   remove the holds (only for the documented update procedure)
+# The tested versions are in /usr/share/archimet/tested-kismet.txt ("package version" per line).
+set -eu
+TESTED=/usr/share/archimet/tested-kismet.txt
+[ -r "$TESTED" ] || { echo "no $TESTED"; exit 1; }
+
+case "${1:-status}" in
+apply)
+    rc=0
+    while read -r pkg ver; do
+        [ -n "$pkg" ] || continue
+        have=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+        if [ "$have" = "$ver" ]; then
+            apt-mark hold "$pkg" >/dev/null && echo "held $pkg $ver"
+        else
+            echo "NOT HELD: $pkg is '${have:-not installed}', Archimet was tested with $ver"; rc=1
+        fi
+    done < "$TESTED"
+    exit $rc
+    ;;
+status)
+    held=$(apt-mark showhold)
+    while read -r pkg ver; do
+        [ -n "$pkg" ] || continue
+        have=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo "not installed")
+        cand=$(apt-cache policy "$pkg" 2>/dev/null | sed -n 's/^  Candidate: //p')
+        newest=$(apt-cache madison "$pkg" 2>/dev/null | awk '{print $3}' | sort -V | tail -1)
+        h=no; echo "$held" | grep -qx "$pkg" && h=yes
+        printf '%-32s installed %-12s tested %-12s held %-3s newest-in-repo %s\n' "$pkg" "$have" "$ver" "$h" "${newest:-?}"
+        if [ -n "$newest" ] && [ "$newest" != "$ver" ]; then
+            echo "  NOTICE: Kismet $newest is available. Archimet has not been tested with it; it is not installed."
+        fi
+    done < "$TESTED"
+    ;;
+release)
+    while read -r pkg ver; do [ -n "$pkg" ] && apt-mark unhold "$pkg" >/dev/null && echo "released $pkg"; done < "$TESTED"
+    echo "Holds released. Follow docs/UPDATES.md; re-apply with: archimet-hold apply"
+    ;;
+*) sed -n '2,6p' "$0"; exit 2 ;;
+esac

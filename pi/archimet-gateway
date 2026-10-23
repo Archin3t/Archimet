@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Archinet
+"""Archimet gateway: the only network-facing web entry point of an Archimet Pi.
+
+  * Serves Archimet's web interface from ARCHIMET_WWW (default /usr/share/archimet/www), files only,
+    never outside that directory.
+  * Proxies exactly the Kismet REST routes Archimet uses (ROUTES: method + path pattern) to Kismet,
+    which listens on 127.0.0.1 only. Kismet's own static pages, plugin paths, pcap downloads, logging
+    controls and anything else are never proxied: they answer 404 here.
+  * Proxies /archimet/* to the Archimet logger (127.0.0.1 only).
+  * The account is Kismet's own (one user). The gateway holds no credentials.
+
+Setup lock (server side, not a UI warning):
+  * A fresh install provisions the account archimet / archimet. While that default still signs in
+    to Kismet (or Kismet has no account at all), the Pi is in SETUP: only clients on this Pi itself
+    (127.0.0.1 / ::1, e.g. through an SSH tunnel) are served, and only sign-in and the credential
+    change pass; every data route answers 403. Other LAN / hotspot clients get a "setup not finished"
+    page and can neither use nor claim the shared default.
+  * Network clients are served only when setup is finished AND HTTPS is active (TLS certificate
+    present). Without a certificate the gateway stays loopback-only.
+  * Every credential change through the gateway must pass POLICY (not the default password, not the
+    user name, at least 10 characters).
+
+Sessions:
+  * Kismet's session cookie (KISMET) is accepted only if the gateway issued it (sign-in through the
+    gateway). A credential change, or "sign out" (POST /archimet-session/logout), ends the sessions,
+    so old sessions stop working at once. Restarting the gateway signs everyone out.
+  * Set-Cookie from Kismet is passed back with HttpOnly, SameSite=Strict, and Secure under TLS.
+
+TLS: certificate and key from systemd credentials (LoadCredential server.crt / server.key, made by
+archimet-tls) or ARCHIMET_TLS_CERT / ARCHIMET_TLS_KEY paths. A plain-HTTP request on the TLS port is
+answered with a redirect to https://.
+
+Environment (from /etc/default/archimet):
+  ARCHIMET_GATEWAY_BIND   0.0.0.0:2501
+  ARCHIMET_KISMET_URL     http://127.0.0.1:2500
+  ARCHIMET_LOGGER_URL     http://127.0.0.1:2502
+  ARCHIMET_WWW            /usr/share/archimet/www
+"""
+import base64
+import collections
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "archimet-gateway 1.1.0"
+ENV = os.environ.get
+BIND = ENV("ARCHIMET_GATEWAY_BIND", "0.0.0.0:2501")
+KISMET = ENV("ARCHIMET_KISMET_URL", "http://127.0.0.1:2500").rstrip("/")
+LOGGER = ENV("ARCHIMET_LOGGER_URL", "http://127.0.0.1:2502").rstrip("/")
+WWW = Path(ENV("ARCHIMET_WWW", "/usr/share/archimet/www")).resolve()
+CA_CERT = Path(ENV("ARCHIMET_CA_CERT", "/etc/archimet/tls/ca.crt"))   # public; offered to phones for trust
+MAX_BODY = 1 << 20
+DEFAULT_USER = DEFAULT_PASSWORD = "archimet"     # fresh-install account; must be replaced before use
+USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+NUM = r"\d+(?:\.\d+)?"
+KEY = r"[A-Za-z0-9_%:.-]{1,96}"
+# Every Kismet route the Archimet UI (ui/js/api/kismet.js) and its compatibility check use.
+ROUTES = [(set(m.split("|")), re.compile(p + r"\Z")) for m, p in (
+    ("GET|POST", r"/session/check_login"),
+    ("GET", r"/session/check_session"),
+    ("GET", r"/session/check_setup_ok"),
+    ("POST", r"/session/set_password"),
+    ("GET", r"/system/status\.json"),
+    ("GET", r"/devices/views/all_views\.json"),
+    ("GET|POST", r"/devices/views/[A-Za-z0-9_.:-]{1,80}/devices\.json"),
+    ("GET|POST", rf"/devices/by-key/{KEY}/device\.json"),
+    ("POST", rf"/devices/by-key/{KEY}/set_(?:name|tag)\.cmd"),
+    ("GET|POST", r"/devices/by-mac/[0-9A-F]{2}(?::[0-9A-F]{2}){5}/devices\.json"),
+    ("POST", r"/devices/multi(?:mac|key)/devices\.json"),
+    ("GET|POST", rf"/devices/last-time/{NUM}/devices\.json"),
+    ("GET", rf"/alerts/last-time/{NUM}/alerts\.json"),
+    ("GET", r"/alerts/definitions\.json"),
+    ("GET", rf"/messagebus/last-time/{NUM}/messages\.json"),
+    ("GET", r"/datasource/(?:all_sources|types)\.json"),
+    ("GET|POST", r"/datasource/list_interfaces\.cmd"),
+    ("POST", r"/datasource/add_source\.cmd"),
+    ("POST", rf"/datasource/by-uuid/{UUID}/set_(?:channel|hop)\.cmd"),
+    ("GET|POST", rf"/datasource/by-uuid/{UUID}/(?:open|close)_source\.cmd"),
+    ("GET", r"/channels/channels\.json"),
+    ("GET", r"/gps/location\.json"),
+    ("GET", r"/packetchain/packet_stats\.json"),
+    ("GET", r"/phy/all_phys\.json"),
+    ("GET", r"/plugins/all_plugins\.json"),
+    ("GET|POST", r"/phy/phy80211/ssids/views/ssids\.json"),
+    ("GET", r"/auth/apikey/list\.json"),
+)]
+# During setup only these pass (sign in, see the session, change the credentials).
+SETUP_ROUTES = {"/session/check_login", "/session/check_session", "/session/check_setup_ok", "/session/set_password"}
+TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+         ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
+         ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8", ".crt": "application/x-x509-ca-cert"}
+SECURITY = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+            "Cross-Origin-Opener-Policy": "same-origin", "Permissions-Policy": "camera=(), microphone=(), geolocation=()"}
+LOCKED_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Archimet: setup not finished</title><style>body{{font:16px/1.5 system-ui,sans-serif;background:#05060a;color:#dde4f0;
+max-width:34rem;margin:3rem auto;padding:0 1rem}}code{{background:#111a2b;padding:.1rem .3rem;border-radius:3px}}</style>
+<h1>Archimet is not open to the network yet</h1><p>{why}</p>
+<p>Finish setup from this Pi itself, or from your computer through an SSH tunnel:</p>
+<p><code>ssh -L 2501:127.0.0.1:2501 &lt;user&gt;@&lt;this Pi&gt;</code><br>then open <code>{scheme}://localhost:2501/</code>.</p>
+<p>Instructions: <code>/usr/share/doc/archimet/INSTALL.md</code></p>"""
+
+
+def kismet_route(method, path):
+    return any(method in m and r.match(path) for m, r in ROUTES)
+
+
+def static_file(path):
+    """The file under WWW for a URL path, or None. Never follows a path out of WWW."""
+    rel = path.lstrip("/") or "index.html"
+    if "\\" in rel or "\0" in rel or any(p in ("", ".", "..") or p.startswith(".") for p in rel.split("/")):
+        return None
+    f = (WWW / rel).resolve()
+    if not f.is_relative_to(WWW) or not f.is_file():
+        return None
+    return f
+
+
+def is_loopback(addr):
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        return ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped is not None and ip.ipv4_mapped.is_loopback)
+    except ValueError:
+        return False
+
+
+def policy_problem(user, password):
+    """Why a new user name / password is refused, or "" when it is acceptable."""
+    if not USER_RE.match(user or ""):
+        return "User name: 1-32 letters, digits, dots, dashes or underscores."
+    if not password or len(password) < 10:
+        return "Password: at least 10 characters."
+    if password == DEFAULT_PASSWORD:
+        return "Choose a password other than the default."
+    if password.lower() == user.lower():
+        return "The password must differ from the user name."
+    return ""
+
+
+class Setup:
+    """Whether the Pi is still in setup: the default account signs in, or Kismet has no account.
+    Asked of Kismet itself (cached briefly); unknown counts as setup (fail closed)."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.until, self.value = 0.0, "unknown"
+
+    def state(self, force=False):
+        with self.lock:
+            if not force and time.monotonic() < self.until:
+                return self.value
+        value = self._ask()
+        with self.lock:
+            self.value, self.until = value, time.monotonic() + (60 if value == "done" else 10)
+        return value
+
+    def _ask(self):
+        try:
+            with urllib.request.urlopen(KISMET + "/session/check_setup_ok", timeout=10) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            e.close()
+            return "unconfigured" if e.code == 500 else "unknown"
+        except (urllib.error.URLError, OSError):
+            return "unknown"
+        basic = "Basic " + base64.b64encode(f"{DEFAULT_USER}:{DEFAULT_PASSWORD}".encode()).decode()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(KISMET + "/session/check_session",
+                                                               headers={"Authorization": basic}), timeout=10) as r:
+                r.read()
+                return "default"
+        except urllib.error.HTTPError as e:
+            e.close()
+            return "done" if e.code in (401, 403) else "unknown"
+        except (urllib.error.URLError, OSError):
+            return "unknown"
+
+
+class Sessions:
+    """KISMET cookies issued through this gateway. Bounded; cleared by a credential change."""
+    def __init__(self, cap=512):
+        self.lock, self.cap, self.ids = threading.Lock(), cap, collections.OrderedDict()
+
+    def add(self, sid):
+        with self.lock:
+            self.ids[sid] = time.time()
+            self.ids.move_to_end(sid)
+            while len(self.ids) > self.cap:
+                self.ids.popitem(last=False)
+
+    def known(self, sid):
+        with self.lock:
+            return sid in self.ids
+
+    def drop(self, sid=None):
+        with self.lock:
+            if sid is None:
+                self.ids.clear()
+            else:
+                self.ids.pop(sid, None)
+
+
+SETUP, SESSIONS = Setup(), Sessions()
+
+
+def cookie_value(header, name="KISMET"):
+    for part in (header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == name:
+            return v
+    return None
+
+
+class Gateway(BaseHTTPRequestHandler):
+    server_version = "Archimet"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+    timeout = 30            # an idle or stalled connection is dropped, never held forever
+
+    def log_message(self, *a):        # no request log: URLs carry MACs and search text
+        pass
+
+    @property
+    def tls(self):
+        return isinstance(self.connection, ssl.SSLSocket)
+
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=(), head=False):
+        self.send_response(code)
+        for k, v in SECURITY.items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def _json(self, code, obj, extra=()):
+        return self._send(code, json.dumps(obj).encode(), "application/json", [("Cache-Control", "no-store"), *extra])
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n < 0 or n > MAX_BODY:
+            return None
+        return self.rfile.read(n) if n else b""
+
+    def _cookie(self, value, clear=False):
+        attrs = "; Path=/; HttpOnly; SameSite=Strict" + ("; Secure" if self.tls else "")
+        return f"KISMET={'' if clear else value}{attrs}" + ("; Max-Age=0" if clear else "")
+
+    def _proxy(self, base, path_qs, body, session_ok, before_reply=None):
+        h = {k: self.headers[k] for k in ("Authorization", "Content-Type", "Origin", "X-Archimet", "Accept")
+             if self.headers.get(k)}
+        sid = cookie_value(self.headers.get("Cookie"))
+        if sid and session_ok:
+            h["Cookie"] = "KISMET=" + sid           # only Kismet's session cookie, and only one we issued
+        h["Host"] = self.headers.get("Host") or ""  # the logger's Origin check compares against it
+        req = urllib.request.Request(base + path_qs, data=body if self.command == "POST" else None, headers=h,
+                                     method=self.command)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                code, data, rh = r.status, r.read(), r.headers
+        except urllib.error.HTTPError as e:
+            with e:
+                code, data, rh = e.code, e.read(), e.headers
+        except (urllib.error.URLError, OSError):
+            self._json(502, {"error": "the service behind Archimet is not answering"})
+            return 502, None
+        extra, issued = [("Cache-Control", "no-store")], None
+        for c in rh.get_all("Set-Cookie") or []:
+            v = cookie_value(c.split(";", 1)[0])
+            if v is not None:
+                issued = v
+                extra.append(("Set-Cookie", self._cookie(v)))
+        if before_reply:
+            before_reply(code, issued)           # state changes land before the client can act on the reply
+        self._send(code, data, rh.get("Content-Type") or "application/octet-stream", extra)
+        return code, issued
+
+    def _locked(self, why):
+        page = LOCKED_PAGE.format(why=why, scheme="https" if self.tls else "http").encode()
+        return self._send(403, page, "text/html; charset=utf-8", [("Cache-Control", "no-store")], self.command == "HEAD")
+
+    def _handle(self):
+        path_qs = self.path if self.path.startswith("/") else "/"
+        path = path_qs.split("?", 1)[0]
+        if self.command == "POST":
+            body = self._body()
+            if body is None:
+                return self._send(413, b"request body too large")
+        else:
+            body = None
+        if path == "/archimet-ca.crt" and self.command in ("GET", "HEAD"):
+            # The public CA certificate, so a phone can install it before it trusts HTTPS (not secret).
+            try:
+                data = CA_CERT.read_bytes()
+            except OSError:
+                return self._send(404, b"no local CA yet (sudo archimet-tls init)")
+            return self._send(200, data, "application/x-x509-ca-cert",
+                              [("Content-Disposition", 'attachment; filename="archimet-ca.crt"')], self.command == "HEAD")
+        state = SETUP.state()
+        local = is_loopback(self.client_address[0])
+        if not local:
+            if state != "done":
+                return self._locked("Setup is not finished: the default password has not been changed yet."
+                                    if state == "default" else "Setup is not finished (no account yet, or Kismet is not answering).")
+            if not self.tls:
+                return self._locked("HTTPS is not configured yet. Run: sudo archimet-tls init")
+        setup = state != "done"
+        if path == "/archimet-config.json" and self.command in ("GET", "HEAD"):
+            cfg = {"apiBase": "/archimet/", "gateway": VERSION, "setup": state if setup else "", "tls": self.tls,
+                   "defaultUser": DEFAULT_USER if state == "default" else ""}
+            return self._send(200, json.dumps(cfg).encode(), "application/json", [("Cache-Control", "no-store")],
+                              self.command == "HEAD")
+        sid = cookie_value(self.headers.get("Cookie"))
+        session_ok = bool(sid) and SESSIONS.known(sid)
+        if path == "/archimet-session/logout" and self.command == "POST":
+            if sid:
+                SESSIONS.drop(sid)
+            return self._json(200, {"signed_out": True}, [("Set-Cookie", self._cookie("", clear=True))])
+        if path.startswith("/archimet/"):
+            if setup and path != "/archimet/health":
+                return self._json(403, {"error": "setup required", "detail": "change the default password first"})
+            self._proxy(LOGGER, path_qs, body, session_ok)
+            return None
+        if kismet_route(self.command, path):
+            if setup and path not in SETUP_ROUTES:
+                return self._json(403, {"error": "setup required", "detail": "change the default password first"})
+            if path == "/session/set_password":
+                form = urllib.parse.parse_qs((body or b"").decode("utf-8", "replace"))
+                user, pw = (form.get("username") or [""])[0], (form.get("password") or [""])[0]
+                problem = policy_problem(user, pw)
+                if problem:
+                    return self._json(422, {"error": "policy", "detail": problem})
+                if state == "unconfigured" and not local:
+                    return self._json(403, {"error": "setup required"})
+            def before_reply(code, issued):
+                if path == "/session/set_password" and code == 200:
+                    SESSIONS.drop()                 # every existing session ends with the old credentials
+                    SETUP.state(force=True)
+                elif issued and code == 200 and path.startswith("/session/"):
+                    SESSIONS.add(issued)
+            self._proxy(KISMET, path_qs, body, session_ok, before_reply)
+            return None
+        if self.command in ("GET", "HEAD"):
+            f = static_file(path)
+            if f is not None:
+                data = f.read_bytes()
+                return self._send(200, data, TYPES.get(f.suffix, "application/octet-stream"),
+                                  [("Cache-Control", "no-cache")], self.command == "HEAD")
+        return self._send(404, b"not found")
+
+    do_GET = do_POST = do_HEAD = _handle
+
+    def do_PUT(self):
+        self._send(405, b"method not allowed")
+    do_DELETE = do_PATCH = do_OPTIONS = do_PUT
+
+
+class Server(ThreadingHTTPServer):
+    """TLS is negotiated per connection, in that connection's thread: a silent client blocks no one.
+    A plain-HTTP request on the TLS port gets a redirect to https:// instead of a TLS error."""
+    daemon_threads = True
+    ctx = None
+
+    def finish_request(self, request, client_address):
+        if self.ctx is not None:
+            request.settimeout(Gateway.timeout)
+            try:
+                first = request.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return
+            if first and first[0] != 0x16:
+                return self._redirect(request)
+            try:
+                request = self.ctx.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError):
+                return
+        self.RequestHandlerClass(request, client_address, self)
+
+    def _redirect(self, request):
+        try:
+            head = request.recv(8192).decode("latin-1", "replace")
+            m = re.search(r"^Host:\s*([^\s:]+|\[[^\]]+\])", head, re.M | re.I)
+            p = re.match(r"^[A-Z]+ (/[^\s]*) HTTP", head)
+            host = m.group(1) if m and re.match(r"^[A-Za-z0-9.\-\[\]:]+$", m.group(1)) else "localhost"
+            loc = f"https://{host}:{self.server_address[1]}{p.group(1) if p else '/'}"
+            msg = b"Archimet uses HTTPS on this port.\n"
+            request.sendall((f"HTTP/1.1 301 Moved Permanently\r\nLocation: {loc}\r\nContent-Type: text/plain\r\n"
+                             f"Content-Length: {len(msg)}\r\nConnection: close\r\n\r\n").encode() + msg)
+        except OSError:
+            pass
+
+
+def make_server(bind=None):
+    host, _, port = (bind or BIND).rpartition(":")
+    srv = Server((host.strip("[]") or "0.0.0.0", int(port)), Gateway)
+    cert, key = ENV("ARCHIMET_TLS_CERT", "server.crt"), ENV("ARCHIMET_TLS_KEY", "server.key")
+    # Bare names come from systemd LoadCredential= (the gateway's DynamicUser cannot read /etc keys).
+    creds = ENV("CREDENTIALS_DIRECTORY", "")
+    cert, key = ((os.path.join(creds, p) if "/" not in p else p) for p in (cert, key))
+    if all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in (cert, key)):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        srv.ctx = ctx
+    return srv
+
+
+def main():
+    if not (WWW / "index.html").is_file():
+        sys.exit(f"no web interface at {WWW}")
+    srv = make_server()
+    print(f"{VERSION}: Archimet on {BIND} ({'HTTPS' if srv.ctx else 'no certificate: loopback only'}); "
+          f"Kismet {KISMET}, logger {LOGGER}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
