@@ -50,4 +50,4 @@ The Archive screen provides authenticated, read-only search, sort and paging **p
 
 ## Is this release ready to install from GitHub?
 
-There is no published release yet. The current package is a candidate with outstanding Pi and field checks. [Status](STATUS.md) lists them; the [Install](INSTALL.md) guide describes the intended release procedure once approved assets exist.
+There is a source-preview GitHub Release, but no approved installer or downloadable Archimet `.deb` yet. The current package is a candidate with outstanding Pi and field checks. [Status](STATUS.md) lists them; the [Install](INSTALL.md) guide describes the intended procedure once approved assets exist.
