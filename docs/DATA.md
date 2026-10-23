@@ -35,7 +35,7 @@ lasts one capture run (until Kismet restarts).
 | Devices, SSIDs, Channels, Alerts, Messages | Kismet API (through the gateway) | **this capture run** only |
 | LE History | `law_enforcement.sqlite` via the logger API, with Kismet's last-heard time | persistent, all runs |
 | Review | `archimet_review.sqlite` via the logger API | rows heard in this capture run; the rest are linked to the Archive |
-| Archive | each stored table above through an authenticated read-only UI; the logger also has a combined-table API | everything stored, all runs |
+| Archive | every table above, read-only | everything stored, all runs |
 | Server / Radios hardware | logger metrics and `hardware_events.json` | live + last 500 events |
 
 "Last observed" is a real observation time: Kismet's `last_time` in this run, or the logger's
@@ -49,7 +49,7 @@ invented.
 | `/etc/archimet/kismet-archimet.conf` | Kismet settings for Archimet (loopback web server, web root, retention), loaded with `--override` | conffile: your edits kept, dpkg asks on conflict |
 | `/etc/apt/preferences.d/archimet-kismet` | apt pin to the tested Kismet versions | conffile |
 | `/etc/default/archimet` | account, data path, ports | written once, kept; migrated additively (marker `archimet-defaults v2`) |
-| `/etc/archimet/tls/` | local CA and Pi HTTPS certificate; private keys stay on Pi | generated once, kept; server certificate can be renewed |
+| `/etc/archimet/tls/` | local CA (`ca.crt` public, `ca.key` 600) and this Pi's certificate, made by `archimet-tls` | kept; `sudo archimet-tls renew` for new addresses |
 | `/etc/archimet/hotspot.conf` | the radio of an Archimet-created hotspot (optional) | kept |
 | `/etc/systemd/system/kismet.service.d/10-archimet-user.conf`, `/etc/systemd/system/archimet-logger.service.d/10-user.conf` | the account the services run as | regenerated from `/etc/default/archimet` |
 | `/usr/lib/systemd/system/kismet.service.d/archimet.conf` | vendor drop-in: runs Kismet with `--override /etc/archimet/kismet-archimet.conf` | replaced |
@@ -61,15 +61,16 @@ invented.
 `/usr/share/archimet/www/` (web interface), `/usr/share/archimet/le_rules.json`,
 `/usr/share/archimet/tested-kismet.txt` and `tested-kismet.sha256`,
 `/usr/share/archimet/no-user-web-root/` (empty: disables Kismet's per-user web root),
-`/usr/lib/archimet/` (logger, gateway, metrics,
-`archimet-compat`, `archimet-setup`, `archimet-hold`, `archimet-selftest`, `archimet-tls`, `archimet-account`; the admin tools are linked in
-`/usr/sbin`), `/lib/systemd/system/archimet-{logger,gateway}.service`,
+`/usr/lib/archimet/` (logger, gateway, metrics, `archimet-compat`, `archimet-setup`, `archimet-hold`,
+`archimet-selftest`, `archimet-tls`, `archimet-account`; all but the logger, gateway and metrics are linked
+in `/usr/sbin`), `/lib/systemd/system/archimet-{logger,gateway}.service`,
 `/usr/share/doc/archimet/`. The full list ships with each release (`.contents.txt`).
 
 ## Backups
 
-Back up the directory named by `ARCHIMET_OUT`, the Kismet account and device-name files, capture
-source configuration, TLS CA/key, and the exact installed package assets. Make consistent SQLite
-copies with SQLite's backup API while the logger is running, or stop the services before copying.
-Keep the archive **off the Pi**, verify its checksums and perform a test restore. It contains the
-login and captured metadata, so encrypt it and never commit it to this repository.
+`python tools/offpi_backup.py <label>` (from the workstation) writes one compressed archive **off the
+Pi** (`local/backups/`, not tracked by git): consistent SQLite copies made with SQLite's backup API,
+configuration, account files, the logs and the Kismet packages for rollback. It then restores the
+whole archive into a temporary directory and checks every file size, every database's
+`integrity_check`, every `.deb` and the key files. The archive holds the login and captured data:
+keep it private.

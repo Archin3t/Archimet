@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Device inspector: disclosure tree over the real Kismet record plus the logger's view of
  * the MAC. Nothing here is synthesised; absent data says so. No packets are kept or shown. */
 
@@ -131,7 +132,7 @@ async function render(dev, mac, siblings, token) {
     tree.append(section("Overview", newest ? `last heard ${relTime(newest)}` : "from the logs", kv([
         ["Name", name || (ident ? h("span", {}, ident.label, h("span", { class: "dim why" }, " — " + ident.reason)) : null)],
         ident && name && ident.reason ? ["Name source", ident.reason] : null,
-        ["Radio", bd ? h("span", { class: bd.conflict ? "band-conflict" : "", title: radioTitle(bd) }, bd.conflict ? `${bd.conflict.text} (see Radio & identity)` : bd.detail) : null],
+        ["Radio", bd ? h("span", { class: bd.conflict ? "band-conflict" : "", title: radioTitle(bd) }, bd.conflict ? `${bd.conflict.text} (see Radio & identity)` : bd.detail + (bd.differ ? ` · channel reports differ (${bd.differ.short}; see Radio & identity)` : "")) : null],
         ["MAC", h("span", { class: "mono" }, mac)],
         ["Manufacturer", dev ? dev["kismet.device.base.manuf"] : (off || rv || {}).manufacturer],
         ["Type", dev ? dev["kismet.device.base.type"] : (off || rv || {}).type],
@@ -172,7 +173,7 @@ async function render(dev, mac, siblings, token) {
             return src ? src["kismet.datasource.name"] : s["kismet.common.seenby.uuid"];
         });
         tree.append(section("Radio & identity",
-            `ch ${dev["kismet.device.base.channel"] || "—"}${bd.conflict ? " · conflicting readings" : ""} · ${sig["kismet.common.signal.last_signal"] != null ? sig["kismet.common.signal.last_signal"] + " dBm" : "no signal"}`,
+            `ch ${bd.differ ? bd.differ.short : dev["kismet.device.base.channel"] || "—"}${bd.conflict ? " · conflicting readings" : ""} · ${sig["kismet.common.signal.last_signal"] != null ? sig["kismet.common.signal.last_signal"] + " dBm" : "no signal"}`,
             h("div", {},
                 kv([
                     ["Band", bd.conflict ? h("span", { class: "band-conflict" }, "not stated: the readings conflict") : bd.detail],
@@ -181,7 +182,7 @@ async function render(dev, mac, siblings, token) {
                     bd.differ ? ["Channel reports", h("span", { class: "band-differ" }, bd.differ.text + ". ", h("span", {}, bd.differ.why))] : null,
                     ["Last packet", dev["kismet.device.base.frequency"] ? h("span", {}, `${(dev["kismet.device.base.frequency"] / 1000).toFixed(0)} MHz`, h("span", { class: "faint" }, "  · the frequency tag of the most recent packet (the hopping radio's channel)")) : null],
                     freqs.length ? ["Heard on (this run)", freqs.map(([f, n]) => `${Math.round(f / 1000)} MHz ×${num(n)}`).join(" · ")] : null,
-                    bd.readings ? ["Readings", h("span", { class: bd.conflict ? "band-conflict" : "" }, bd.conflict ? "Conflicting readings. " : bd.readings.state === "consistent" ? "Channel corroborated. " : bd.readings.state === "unverified" ? "Band unverified. " : "Not enough data. ", bd.readings.why,
+                    bd.readings ? ["Readings", h("span", { class: bd.conflict ? "band-conflict" : "" }, bd.conflict ? "Conflicting readings. " : bd.readings.state === "consistent" ? (bd.differ ? `${bd.readings.disagreement.supported === "beacon" ? "Beacon channel" : "Channel field"} corroborated; the other report disagrees. ` : "Channel corroborated. ") : bd.readings.state === "unverified" ? "Band unverified. " : "Not enough data. ", bd.readings.why,
                         bd.readings.note ? h("div", { class: "faint", style: { marginTop: "4px" } }, bd.readings.note) : null)] : null,
                     ["Signal", sig["kismet.common.signal.last_signal"] != null ? `${sig["kismet.common.signal.last_signal"]} dBm (min ${sig["kismet.common.signal.min_signal"]}, max ${sig["kismet.common.signal.max_signal"]})` : null],
                     ["Encryption", dev["kismet.device.base.crypt"]],

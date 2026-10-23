@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Tests for pi/archimet-gateway, the only network-facing entry point. A fake Kismet models the one
 account (default / changed / none), its sessions and set_password; a fake logger records what reaches
 it. Non-loopback clients are simulated by patching is_loopback."""
@@ -67,8 +67,9 @@ class FakeKismet:
                     return self._out(401, {})
                 cookie = None
                 if p == "/session/check_login":
-                    up.n += 1
-                    cookie = f"s{up.n}"
+                    # Like Kismet 2025-09-R1 (measured on the Pi): the SAME token for every sign-in with the
+                    # same credentials, and it stays valid after the credentials change.
+                    cookie = "ks-" + base64.b64encode((self.headers.get("Authorization") or "").encode()).decode()[:12]
                     up.sessions.add(cookie)
                 return self._out(200, {"upstream": "kismet", "path": self.path}, cookie)
             do_GET = do_POST = _any
@@ -172,7 +173,7 @@ class Gateway(unittest.TestCase):
     def login(self, u="owner", p="a-long-owner-pass", base=None, ctx=None):
         code, _, h = self.call("/session/check_login", headers=basic(u, p), base=base, ctx=ctx)
         c = h.get_all("Set-Cookie") or []
-        return code, (re.search(r"KISMET=([^;]*)", c[0]).group(1) if c else None), c
+        return code, (re.search(r"ARCHIMET=([^;]*)", c[0]).group(1) if c else None), c
 
     # ---------------------------------------------------------------- files and routes
     def test_serves_archimet_and_config(self):
@@ -249,31 +250,54 @@ class Gateway(unittest.TestCase):
         self.assertIn("HttpOnly", cookies[0])
         self.assertIn("SameSite=Strict", cookies[0])
         self.assertNotIn("Secure", cookies[0])                     # plain HTTP here (loopback); Secure under TLS
-        code, _, _ = self.call("/devices/views/all/devices.json", "POST", b"page=0", {**FORM, "Cookie": f"KISMET={sid}"})
+        self.assertFalse(any("KISMET=" in c for c in cookies))           # Kismet's own token never reaches the browser
+        code, _, _ = self.call("/devices/views/all/devices.json", "POST", b"page=0", {**FORM, "Cookie": f"ARCHIMET={sid}"})
         self.assertEqual(code, 200)
-        self.assertEqual(self.kismet.seen[-1]["headers"].get("Cookie"), f"KISMET={sid}")
+        fwd = self.kismet.seen[-1]["headers"].get("Cookie")
+        self.assertTrue(fwd.startswith("KISMET=ks-") and sid not in fwd)       # the mapped Kismet session, not the token
 
     def test_unknown_or_forged_cookie_is_not_forwarded(self):
         self.kismet.sessions.add("made-elsewhere")
-        code, _, _ = self.call("/system/status.json", headers={"Cookie": "KISMET=made-elsewhere"})
-        self.assertEqual(code, 401)
-        self.assertNotIn("Cookie", self.kismet.seen[-1]["headers"])
+        for cookie in ("KISMET=made-elsewhere", "ARCHIMET=made-elsewhere", "ARCHIMET=; KISMET=made-elsewhere"):
+            code, _, _ = self.call("/system/status.json", headers={"Cookie": cookie})
+            self.assertEqual(code, 401, cookie)
+            self.assertNotIn("Cookie", self.kismet.seen[-1]["headers"])
+
+    def test_revocation_survives_kismet_reusing_its_token(self):
+        """Regression (measured on the Pi 2026-10-23): Kismet hands the same token to a new sign-in, so
+        revoking Kismet tokens let old browsers back in. Gateway tokens are new on every sign-in."""
+        _, old, _ = self.login()
+        _, again, _ = self.login()
+        self.assertNotEqual(old, again)
+        self.call("/archimet-session/logout", "POST", b"", {"Cookie": f"ARCHIMET={old}"})
+        _, fresh, _ = self.login()                                  # Kismet returns the same token again
+        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={old}"})[0], 401)
+        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={fresh}"})[0], 200)
+
+    def test_idle_session_expires(self):
+        _, sid, _ = self.login()
+        saved = self.G.Sessions.IDLE
+        self.G.Sessions.IDLE = -1
+        try:
+            self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={sid}"})[0], 401)
+        finally:
+            self.G.Sessions.IDLE = saved
 
     def test_logout_ends_the_session_at_the_gateway(self):
         _, sid, _ = self.login()
-        code, _, h = self.call("/archimet-session/logout", "POST", b"", {"Cookie": f"KISMET={sid}"})
+        code, _, h = self.call("/archimet-session/logout", "POST", b"", {"Cookie": f"ARCHIMET={sid}"})
         self.assertEqual(code, 200)
         self.assertIn("Max-Age=0", h.get_all("Set-Cookie")[0])
-        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"KISMET={sid}"})[0], 401)
+        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={sid}"})[0], 401)
 
     def test_credential_change_ends_every_session(self):
         _, a, _ = self.login()
         _, b, _ = self.login()
         body = urllib.parse.urlencode({"username": "owner2", "password": "another-long-pass"}).encode()
-        code, _, _ = self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"KISMET={a}"})
+        code, _, _ = self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"ARCHIMET={a}"})
         self.assertEqual(code, 200)
         for sid in (a, b):
-            self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"KISMET={sid}"})[0], 401)
+            self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={sid}"})[0], 401)
         self.assertEqual(self.login("owner", "a-long-owner-pass")[0], 401)       # old credentials fail
         self.assertEqual(self.login("owner2", "another-long-pass")[0], 200)      # new ones work
 
@@ -281,7 +305,7 @@ class Gateway(unittest.TestCase):
         _, sid, _ = self.login()
         for user, pw in (("owner", "short"), ("owner", "archimet"), ("longusername", "LongUserName"), ("bad user", "a-long-pass-123")):
             body = urllib.parse.urlencode({"username": user, "password": pw}).encode()
-            code, out, _ = self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"KISMET={sid}"})
+            code, out, _ = self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"ARCHIMET={sid}"})
             self.assertEqual((code, json.loads(out)["error"]), (422, "policy"), (user, pw))
         self.assertEqual(self.kismet.account, ("owner", "a-long-owner-pass"))
 
@@ -293,20 +317,20 @@ class Gateway(unittest.TestCase):
         code, sid, _ = self.login("archimet", "archimet")
         self.assertEqual(code, 200)                                              # sign-in works (loopback)
         for p in ("/system/status.json", "/devices/views/all_views.json", "/datasource/all_sources.json"):
-            self.assertEqual(self.call(p, headers={"Cookie": f"KISMET={sid}"})[0], 403, p)
+            self.assertEqual(self.call(p, headers={"Cookie": f"ARCHIMET={sid}"})[0], 403, p)
             self.assertEqual(self.call(p, headers=basic("archimet", "archimet"))[0], 403, p)
         for p in ("/archimet/state.json", "/archimet/le_history.json", "/archimet/archive.json"):
-            self.assertEqual(self.call(p, headers={"Cookie": f"KISMET={sid}"})[0], 403, p)
+            self.assertEqual(self.call(p, headers={"Cookie": f"ARCHIMET={sid}"})[0], 403, p)
         self.assertEqual(self.logger.seen, [])
         # The forced change: a username change is optional, the password must change.
         body = urllib.parse.urlencode({"username": "archimet", "password": "archimet"}).encode()
-        self.assertEqual(self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"KISMET={sid}"})[0], 422)
+        self.assertEqual(self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"ARCHIMET={sid}"})[0], 422)
         body = urllib.parse.urlencode({"username": "archimet", "password": "now-a-strong-one"}).encode()
-        self.assertEqual(self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"KISMET={sid}"})[0], 200)
+        self.assertEqual(self.call("/session/set_password", "POST", body, {**FORM, "Cookie": f"ARCHIMET={sid}"})[0], 200)
         self.assertEqual(json.loads(self.call("/archimet-config.json")[1])["setup"], "")
-        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"KISMET={sid}"})[0], 401)  # old session ended
+        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={sid}"})[0], 401)  # old session ended
         _, sid2, _ = self.login("archimet", "now-a-strong-one")
-        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"KISMET={sid2}"})[0], 200)
+        self.assertEqual(self.call("/system/status.json", headers={"Cookie": f"ARCHIMET={sid2}"})[0], 200)
 
     def test_network_clients_cannot_use_or_claim_the_default(self):
         self.set_account(("archimet", "archimet"))
@@ -350,10 +374,10 @@ class Gateway(unittest.TestCase):
     def test_logger_proxied_without_upstream_cors(self):
         _, sid, _ = self.login()
         code, _, h = self.call("/archimet/review", "POST", b"{}", {"Content-Type": "application/json", "X-Archimet": "1",
-                                                                     "Origin": "http://pi.local:2501", "Cookie": f"KISMET={sid}"})
+                                                                     "Origin": "http://pi.local:2501", "Cookie": f"ARCHIMET={sid}"})
         s = self.logger.seen[-1]
-        self.assertEqual((s["path"], s["headers"]["Origin"], s["headers"]["X-Archimet"], s["headers"]["Cookie"]),
-                         ("/archimet/review", "http://pi.local:2501", "1", f"KISMET={sid}"))
+        self.assertEqual((s["path"], s["headers"]["Origin"], s["headers"]["X-Archimet"]), ("/archimet/review", "http://pi.local:2501", "1"))
+        self.assertTrue(s["headers"]["Cookie"].startswith("KISMET=ks-"))       # the logger checks the Kismet session
         self.assertIsNone(h.get("Access-Control-Allow-Origin"))
 
     # ---------------------------------------------------------------- TLS

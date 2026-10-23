@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Archimet setup helper. Hotspot setup is OPTIONAL: nothing here changes anything unless asked.
 
     archimet-setup detect                         report radios: capture sources, hotspot radios, free radios

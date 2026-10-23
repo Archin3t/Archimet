@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // node tests/test_resize.mjs — resizable columns / panes (ui/js/ui/resize.js) and their persistence,
 // with a minimal DOM shim. Regression for two defects found on 2026-10-23: widths were never saved
 // (the prefs merge dropped new layout keys) and dragging a flexible column only moved its invisible minimum.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* LE History (the LE log, across reboots) and Review (unconfirmed devices). */
 
 import { h, svg, clear, macHex, requestGate } from "../lib/util.js";
@@ -96,7 +97,11 @@ route("history", {
             ...[["all", "Any equipment"], ["known", "Model identified"], ["unknown", "Not identified"]].map(([v, l]) =>
                 h("button", { type: "button", "aria-pressed": String(v === subFilter), onclick: (e) => {
                     subFilter = v; subSeg.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw(); } }, l)));
-        main.append(h("div", { class: "toolbar" }, searchBox((v) => { q = v; draw(); }), whenSeg, classBox, subSeg, meta),
+        // Phones: the three filter groups fold behind one button (always shown on wider screens).
+        const filters = h("div", { class: "filters", id: "le-filters" }, whenSeg, classBox, subSeg);
+        const filtBtn = h("button", { class: "btn filters-btn", type: "button", "aria-expanded": "false", "aria-controls": "le-filters",
+            onclick: () => { const open = filters.classList.toggle("open"); filtBtn.setAttribute("aria-expanded", String(open)); } }, "Filters");
+        main.append(h("div", { class: "toolbar" }, searchBox((v) => { q = v; draw(); }), filtBtn, filters, meta),
             h("div", { class: "page" }, banner, list));
         const LECOLS = [{ id: "device", label: "Device", w: 240, min: 160, flex: 2 }, { id: "evidence", label: "Evidence", w: 140, min: 90 },
             { id: "subtype", label: "Equipment", w: 130, min: 80 }, { id: "reason", label: "Reason", w: 260, min: 120, flex: 2 },
@@ -129,7 +134,13 @@ route("history", {
                 const row = h("div", { class: "lrow m-confirmed", tabindex: "0" },
                     h("div", { class: "who" }, h("span", { class: "glyph" }, svg(ICON[r.radio === "Bluetooth" ? "bt" : /AP/.test(r.type || "") ? "ap" : "client"])),
                         h("div", { class: "names" }, r.name ? [h("span", { class: "name" }, r.name), h("span", { class: "mac" }, r.mac)] : [h("span", { class: "name mono macname" }, r.mac), h("span", { class: "mac" }, r.manufacturer || "")],
-                            h("span", { class: "sub mac" }, `LE log · ${vendor ? "Vendor match: " + vendor : KIND[r.kind]} · equipment ${subtypeText(subs)} · ${s.label} · ${observedText(o)}`))),
+                            r.name ? h("span", { class: "sub mac" }, r.manufacturer || "") : null)),        // equipment is a chip below on phones
+                    // Phones: heard status and last observation on the right; evidence as chips below.
+                    h("div", { class: "m-meta" }, h("span", { class: "m-when" }, statusBadge(s)), h("span", { class: "m-sig" }, observedText(o))),
+                    h("div", { class: "badges m-only" },
+                        h("span", { class: `badge b-${EVID[r.kind]}`, title: TAG[EVID[r.kind]].help }, vendor ? `Vendor match: ${vendor}` : KIND[r.kind]),
+                        ...(subs.length ? subs.map(x => h("span", { class: `badge b-${x}`, title: TAG[x].help }, TAG[x].label))
+                            : [h("span", { class: "badge faint", title: "No model name observed; the vendor prefix names the maker only." }, "equipment not identified")])),
                     h("span", { class: "cell" }, h("span", { class: `badge b-${EVID[r.kind]}`, title: TAG[EVID[r.kind]].help }, vendor ? `Vendor match: ${vendor}` : KIND[r.kind])),
                     h("span", { class: "cell" + (subs.length ? "" : " faint"), title: `Rule category: ${r.category || "—"} (the rule's category, not the device's type).` },
                         subs.length ? subs.map(x => h("span", { class: `badge b-${x}`, title: TAG[x].help }, TAG[x].label)) : "not identified"),

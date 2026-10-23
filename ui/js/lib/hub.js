@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Shared live data: one poll per source, any number of subscribers. */
 
 import { kismet } from "../api/kismet.js";

@@ -19,11 +19,8 @@ archimet-setup detect
 `wlan0` is always treated as reserved, even without a hotspot profile. `archimet-selftest` fails if a
 capture source names a hotspot radio.
 
-After first account setup and certificate trust, reach Archimet over the hotspot at
-`https://<the Pi's hotspot address>:2501/`. The gateway listens on every address **only when**
-setup is complete and local HTTPS is active; otherwise it refuses network clients. If you enable
-a new hotspot address after certificate creation, run `sudo archimet-tls renew` and verify its
-coverage with `archimet-tls status`. See [HTTPS](HTTPS.md).
+Reach Archimet over the hotspot at `http://<the Pi's hotspot address>:2501/`. The gateway listens on
+every address, so Ethernet and the hotspot work alike.
 
 ## Optional: let Archimet create a hotspot
 

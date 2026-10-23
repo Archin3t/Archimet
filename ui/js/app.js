@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Archimet boot: the intro (on every top-level load: new tab or refresh) runs alongside the
  * session check and first data load; then sign-in only if Kismet's session is missing or
  * expired; then the shell. In-app navigation is hash routing and never reloads the page. */

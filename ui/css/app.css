@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Archimet — design system. No external fonts or assets. */
 
 :root {
@@ -623,3 +624,48 @@ body.test-mode .app { margin-top: 24px; height: calc(100vh - 24px); height: calc
 
 /* Resizing is a desktop feature: phones and tablets keep their fixed layouts. */
 @media (max-width: 1100px), (pointer: coarse) { .grip { display: none; } .split { grid-template-columns: var(--split-left, minmax(300px, 46%)) 0 1fr; } }
+
+/* Touch sizes (2026-10-23 audit: 24-30 px targets measured at phone widths). Touch screens and narrow
+   windows get controls at least 40-44 px in the direction a finger needs; desktop mouse layouts keep
+   their density. Text size is unchanged: nothing is shrunk to fit. */
+@media (pointer: coarse), (max-width: 760px) {
+    .menu-btn { min-width: 44px; min-height: 44px; justify-content: center; align-items: center; }
+    .st, .le-pill { min-height: 40px; display: inline-flex; align-items: center; }
+    .chip { padding: 11px 14px; }
+    .seg button { height: 40px; }
+    .nav a { min-height: 44px; }
+    .lhead .hcell button, .lhead button, .table thead button.linklike { min-height: 36px; }
+    .pager .btn, .toolbar .btn, .btn { min-height: 40px; }
+    .table td a, .names a, .alerts a, a.mono, .rail-foot a, .subtype-q a { display: inline-block; min-height: 32px; line-height: 32px; }
+    .check { min-height: 44px; padding: 0; }             /* the whole label is the target, not the 15 px box */
+}
+
+/* Phone layout (2026-10-23 redesign): cards, not a shrunk table. Desktop keeps its grid: the phone-only
+   elements below are display:none above 720 px, so they never take a grid column there. */
+.m-meta, .m-only, .filters-btn { display: none; }
+.filters { display: contents; }
+.src-more > summary { cursor: pointer; color: var(--text-2); font-size: 12.5px; margin: 10px 0 4px; }
+@media (max-width: 720px) {
+    .lrow { grid-template-columns: minmax(0, 1fr) auto !important; align-items: start; padding: 12px 14px 12px 17px; }
+    .lrow .names .name { font-size: 15px; }
+    .lrow .sub { font-size: 12.5px; }
+    .m-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; min-width: 72px; }
+    .m-meta .m-when { font: 600 13px var(--mono); color: var(--text); }
+    .m-meta .m-sig { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--mono); color: var(--text-2); }
+    .m-only { display: flex; }
+    .lrow .badges { grid-column: 1 / -1; flex-wrap: wrap; gap: 6px; }
+    .filters-btn { display: inline-flex; }
+    .filters { display: none; }
+    .filters.open { display: flex; flex-direction: column; align-items: stretch; gap: 8px; flex-basis: 100%; order: 3; }
+    .filters.open .seg { width: 100%; }
+    .filters.open .seg button { flex: 1; }
+    .src-card .kv { grid-template-columns: minmax(84px, 36%) minmax(0, 1fr); gap: 6px 10px; }
+    .src-card .kv > dd { margin: 0; overflow-wrap: anywhere; }
+    .arch-cards { display: grid; }
+    .arch-card { display: grid; gap: 4px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .arch-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .arch-sum { font-size: 12.5px; overflow-wrap: anywhere; }
+    /* A table that must scroll sideways shows a fading edge as the cue. */
+    .table-wrap { overflow-x: auto; background: linear-gradient(to left, var(--bg), transparent 28px) right / 28px 100% no-repeat local,
+        radial-gradient(farthest-side at 100% 50%, rgba(140, 170, 220, .25), transparent) right / 14px 100% no-repeat scroll; }
+}

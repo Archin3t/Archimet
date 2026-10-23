@@ -14,7 +14,7 @@ Archimet release has been tested with newer ones.
 | 5.3.0-1 | — | — | — | trixie armhf (32-bit) | **unavailable**: the Kismet trixie repository publishes amd64 and arm64 only |
 | 5.3.0-1 | — | — | — | Debian 12 "bookworm" and older | **not tested**, not built |
 
-Kismet 2025-09-R1 is git tag `kismet-2025-09-R1`, commit `b5d5a2d04`. The SHA-256 of each tested
+Kismet 2025-09-R1: git tag `kismet-2025-09-R1` = commit `7a3b5d2`; the binaries report their build revision `b5d5a2d04`, the tag's parent, and the tag adds only the generated `version.c`. The SHA-256 of each tested
 upstream package, as published in the signed repository index, is in
 `/usr/share/archimet/tested-kismet.sha256` (source: `packaging/tested-kismet.sha256`).
 
@@ -58,10 +58,13 @@ stop an administrator from doing that; `archimet-selftest` then reports the mism
 
 A new Kismet release is noted, not installed. Adopting it means a new Archimet release:
 
-1. **Back up**: make and restore-test a private, consistent [off-Pi backup](DATA.md#backups) of the databases, Kismet account/configuration and exact package assets.
+1. **Back up**: `python tools/offpi_backup.py pre-kismet-<ver>` (verified and restore-tested, off the Pi).
 2. **Stage**: `apt-get download` the new upstream packages; record their SHA-256 from the signed
    index; set `TESTED` in `packaging/build-deb.sh` and update `packaging/tested-kismet.sha256`.
-3. **Audit in isolation**: install the new engine and candidate package in a separate test environment. Run the repository unit tests, `archimet-compat`, apt-policy tests, and authenticated/anonymous route and write checks against that isolated instance. A contract failure means deliberate UI work, never a silent switch. Keep test credentials and captured data outside the repository.
+3. **Audit in isolation**: `python tools/pi_testenv.py up --package <new deb>`, then `archimet-compat`
+   (every endpoint, field, auth flow and source action Archimet uses), `tools/route_audit.py`,
+   `tools/write_tests.py` and `tools/deployed_ui_check.mjs`. A contract failure means deliberate UI
+   work, never a silent switch.
 4. **Test on the Pi**: back up; `sudo archimet-hold release`; install the new Kismet packages and the
    new Archimet package together; `sudo archimet-hold apply`; reboot; `sudo archimet-selftest`.
 5. **Release** the new Archimet version with its compatibility-matrix row, the attached upstream
@@ -80,11 +83,9 @@ capture helpers or a route in `pi/archimet-gateway` (`ROUTES`) as urgent.
 
 ## Upgrading Archimet itself
 
-Make and verify a private off-Pi backup first ([Data](DATA.md#backups)), then install the tested
-new package and run the self-test:
-
-```sh
-sudo apt install ./archimet_<new>_arm64.deb
+```
+python tools/offpi_backup.py pre-upgrade                 # on the workstation: verified backup, off the Pi
+sudo apt install ./archimet_<new>_arm64.deb              # services restart; data, account and settings stay
 sudo archimet-selftest
 ```
 

@@ -6,7 +6,7 @@ Archimet grew from a practical gap: general radio monitoring could show nearby W
 
 ![Archimet startup animation showing the title and Archinet credit](docs/intro.gif)
 
-> **Release status:** This public repository currently provides source code only. Archimet 5.3.0-1 is a local package candidate, not an approved installer. It has passed isolated tests, but a clean installation and migration on the reference Pi, capture-power retest, phone layout, hotspot and second-device HTTPS checks remain open. Do not treat the source-preview GitHub Release as an installable release. See [release status](docs/STATUS.md).
+> **Release status:** [v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) is a **prerelease for an installation trial**: the Archimet `.deb`, the exact tested Kismet packages, checksums and the Kismet source are attached, and the [install guide](docs/INSTALL.md) uses only those files. It is not yet a production release: the real-hardware gates in [release status](docs/STATUS.md) (power stability, real phone, second-device HTTPS, hotspot) are still open.
 
 ## What it does
 
@@ -56,4 +56,4 @@ The proposed installation uses a downloadable Archimet `.deb` plus the exact tes
 
 ## Credits and licence
 
-Archimet is by Archinet. The upstream Kismet engine and capture helpers are by Mike Kershaw (Dragorn) and contributors. See [NOTICE.md](NOTICE.md) for the component boundary and [LICENSE](LICENSE) for Archimet's GPL v2 licence text. No upstream Kismet files are copied into this repository's package candidate.
+Archimet is by Archinet. The upstream Kismet engine and capture helpers are by Mike Kershaw (Dragorn) and contributors. See [NOTICE.md](NOTICE.md) for the component boundary and [LICENSE](LICENSE) for the GPL v2 text; Archimet is licensed GPL-2.0-or-later (version 2 or any later version). No upstream Kismet files are copied into this repository's package candidate.

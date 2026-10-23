@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Radio band, channel and frequency: the one place they are derived (Devices, inspector, Channels).
  * Pure functions (tests/test_ui.mjs). Only what Kismet observed is used.
  *

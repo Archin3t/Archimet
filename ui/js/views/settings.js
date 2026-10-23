@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Settings, grouped. Each control says whether it changes this browser or the Kismet server. */
 
 import { h, svg, clear } from "../lib/util.js";
@@ -159,7 +160,7 @@ const PANES = {
             ]),
             block("In this browser", "browser", null, [
                 ["Preferences", "Colours, column widths, device filters, units, notification switches and the intro choice, in this browser's local storage (archimet.prefs.v2). The Devices sort is not saved: each visit starts with Last heard, newest first."],
-                ["Session", "One session cookie (KISMET, HttpOnly, SameSite=Strict, HTTPS-only when HTTPS is on). It ends on sign-out, after 2 h without activity, when the account changes, or when the Pi or its gateway restarts. Archimet never stores your password."],
+                ["Session", "One session cookie (ARCHIMET, issued by the Archimet gateway; HttpOnly, SameSite=Strict, HTTPS-only when HTTPS is on). It ends on sign-out, after 2 h without activity, when the account changes, or when the Pi or its gateway restarts. Archimet never stores your password."],
             ]),
             block("Who can see it", null, null, [
                 ["Sign-in", "Every device, LE, Review, history, note, location and hardware request needs a sign-in with the Archimet account; the gateway and the logger both check it."],
@@ -180,8 +181,10 @@ const PANES = {
         sec.append(title("Account", true),
             group("Session", "Sign out ends this browser's session on the Pi (at the Archimet gateway), not only here. Sessions also end after 2 hours without activity, when the account changes, and when the Pi restarts.",
                 h("button", { class: "btn", type: "button", onclick: signOut }, svg(ICON.signout), "Sign out")),
-            group("User name and password", "Your Archimet account (one account per Pi). Change the user name, the password, or both; the current password is checked first. Every other signed-in browser is signed out.",
-                h("button", { class: "btn", type: "button", disabled: ro, onclick: changeAccountDialog }, svg(ICON.lock), "Change…")),
+            group("User name", "The name you sign in with (one Archimet account per Pi; separate from the Pi's Linux login). Your current password is checked first; every other signed-in browser is signed out.",
+                h("button", { class: "btn", type: "button", disabled: ro, onclick: () => changeAccountDialog("user") }, svg(ICON.lock), "Change user name…")),
+            group("Password", "At least 10 characters, not the default and not the user name. Your current password is checked first; every other signed-in browser is signed out.",
+                h("button", { class: "btn", type: "button", disabled: ro, onclick: () => changeAccountDialog("password") }, svg(ICON.lock), "Change password…")),
             h("div", { class: "set-group" }, h("div", { class: "label" }, "API keys (capture engine)"), h("div", { class: "help", style: { gridColumn: "1 / -1" } }, keys)),
             ...(ro ? [h("p", { class: "readonly-note" }, "Read-only preview: account changes are disabled.")] : []));
     },
@@ -190,7 +193,7 @@ const PANES = {
         const box = h("ul", { class: "compat" }, h("li", { class: "faint" }, "not run yet"));
         const ext = (href, text) => h("a", { href, target: "_blank", rel: "noopener noreferrer" }, text);
         const FEATURES = [
-            ["Its own interface", "Archimet replaces Kismet's web pages with this interface, served by Kismet and built only on Kismet's REST API. Kismet itself is not modified."],
+            ["Its own interface", "Archimet's own gateway serves this interface and the parts of Kismet's REST API it needs; Kismet runs behind it on the Pi itself and its stock pages are never reachable. Kismet itself is not modified."],
             ["Wi-Fi and Bluetooth", "Wi-Fi capture is passive (monitor mode; nothing is transmitted). Kismet's Linux Bluetooth source (hci0) is an active scan, not passive capture: it asks nearby devices to identify themselves and reports what they advertise, not packets; on this Pi it reports MAC, type and band only."],
             ["Separate logs", "Access points, Wi-Fi clients and LE devices each have their own log on the Pi, one row per MAC, with first and last seen."],
             ["Evidence, not guesses", "A device enters the LE log by a vendor match (its MAC prefix belongs to an LE-equipment maker), an association (data frames with a device already in the LE log), or your mark with a note. Each row names its evidence; none of them proves police ownership or use. A probe alone is never treated as a connection."],
@@ -198,7 +201,7 @@ const PANES = {
             ["Re-sighting", "Each Review device keeps its last 20 sighting sessions; watched devices notify you when they are heard again."],
             ["Notes", "Mark and Unmark require a note and are kept in an audit trail; Kismet device names and notes are editable in the inspector."],
             ["Clear device labels", "Radio band, category and an explanation of why a device has no name (hidden network, no beacon heard, client, BLE)."],
-            ["Hardware health", "Power and throttling, CPU, temperature, memory, disk, USB and capture-source events from the Pi itself (logger 5.2)."],
+            ["Hardware health", "Power and throttling, CPU, temperature, memory, disk, USB and capture-source events from the Pi itself."],
             ["Private and offline", "Every data request needs the Archimet sign-in. No telemetry, outside fonts or scripts; it works on the Pi's hotspot without internet."],
         ];
         sec.append(
@@ -232,27 +235,30 @@ async function signOut() {
     setTimeout(() => location.reload(), 600);
 }
 
-async function changeAccountDialog() {
+/* what: "user" (new user name, password kept) or "password" (new password, user name kept). */
+async function changeAccountDialog(what) {
     const field = (type, auto) => h("input", { class: "field", type, autocomplete: auto, spellcheck: "false", autocapitalize: "none" });
     const curUser = field("text", "username"), curPass = field("password", "current-password");
     const newUser = field("text", "off"), p1 = field("password", "new-password"), p2 = field("password", "new-password");
     curUser.value = signedInUser();
-    const msg = h("div", { class: "msg", role: "alert" });
+    const user = what === "user";
     const body = h("div", { class: "frame-body account-form" },
         h("label", { class: "eyebrow" }, "Current user name"), curUser,
         h("label", { class: "eyebrow" }, "Current password"), curPass,
-        h("label", { class: "eyebrow" }, "New user name (leave empty to keep)"), newUser,
-        h("label", { class: "eyebrow" }, "New password (leave empty to keep)"), p1,
-        h("label", { class: "eyebrow" }, "New password again"), p2,
-        h("p", { class: "hint" }, "Passwords: at least 10 characters, not the default and not the user name."), msg);
-    const ok = await dialog("Change user name or password", body, { actions: [["Cancel", false, "ghost"], ["Change", true, "primary"]] });
+        ...(user ? [h("label", { class: "eyebrow" }, "New user name"), newUser,
+                    h("p", { class: "hint" }, "1-32 letters, digits, dots, dashes or underscores. Your password stays the same.")]
+            : [h("label", { class: "eyebrow" }, "New password"), p1, h("label", { class: "eyebrow" }, "New password again"), p2,
+               h("p", { class: "hint" }, "At least 10 characters, not the default and not the user name. Your user name stays the same.")]));
+    const ok = await dialog(user ? "Change user name" : "Change password", body,
+        { actions: [["Cancel", false, "ghost"], [user ? "Change user name" : "Change password", true, "primary"]] });
     const wipe = () => { curPass.value = p1.value = p2.value = ""; };
     if (!ok) { wipe(); return; }
-    if (!newUser.value && !p1.value) { wipe(); toast("Not changed", "Nothing to change.", { color: "var(--bad)" }); return; }
-    if (p1.value !== p2.value) { wipe(); toast("Not changed", "The new passwords differ.", { color: "var(--bad)" }); return; }
-    const r = await changeAccount({ currentUser: curUser.value, currentPassword: curPass.value, newUser: newUser.value.trim(), newPassword: p1.value });
+    if (user ? !newUser.value.trim() : !p1.value) { wipe(); toast("Not changed", user ? "Enter a new user name." : "Enter a new password.", { color: "var(--bad)" }); return; }
+    if (!user && p1.value !== p2.value) { wipe(); toast("Not changed", "The new passwords differ.", { color: "var(--bad)" }); return; }
+    const r = await changeAccount({ currentUser: curUser.value, currentPassword: curPass.value,
+        newUser: user ? newUser.value.trim() : "", newPassword: user ? "" : p1.value });
     wipe();
-    toast(r.ok ? "Account changed" : "Not changed", r.message, r.ok ? {} : { color: "var(--bad)" });
+    toast(r.ok ? (user ? "User name changed" : "Password changed") : "Not changed", r.message, r.ok ? {} : { color: "var(--bad)" });
     if (r.relogin) setTimeout(() => location.reload(), 900);
 }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* User-resizable layout: table columns (drag a header's right edge), the sidebar, and split panes.
  * Widths are saved per browser (prefs.layout); Settings › Appearance › Reset layout clears them.
  * Every handle is a focusable separator: Left / Right move 16 px, Home restores the default.

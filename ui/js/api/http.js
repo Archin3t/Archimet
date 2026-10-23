@@ -1,4 +1,5 @@
-/* fetch wrapper. The session is the KISMET cookie, issued through archimet-gateway (same origin). A 401 anywhere
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* fetch wrapper. The session is the ARCHIMET cookie of archimet-gateway (same origin, HttpOnly). A 401 anywhere
  * raises a session-expired event; the shell shows the login sheet and retries. */
 
 const listeners = new Set();

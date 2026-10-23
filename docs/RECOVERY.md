@@ -39,7 +39,7 @@ sudo archimet-selftest
 
 Use verified `.deb` assets from the matching approved release; a future release should include
 their checksums and a rollback copy. A downgrade is always deliberate: the pin never downgrades
-on its own. There is no approved public 5.3 installer yet; the current GitHub Release is a source preview.
+on its own. The [v5.3.0-1](https://github.com/Archin3t/Archimet/releases/tag/v5.3.0-1) prerelease attaches the exact Kismet packages and their checksums.
 
 ## Going back to the previous Archimet release
 

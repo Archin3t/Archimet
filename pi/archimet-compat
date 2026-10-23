@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Archimet / Kismet compatibility check, for use before and after a Kismet update.
 
     archimet-compat [--contract /usr/local/share/archimet/www/js/api/contract.json] [--json]

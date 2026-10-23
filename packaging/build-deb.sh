@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build archimet_<version>_<arch>.deb (needs dpkg-deb; run on the Pi or any Debian system).
 #   bash build-deb.sh <stage-dir> <packaging-dir> <out-dir> [arch]
 # <stage-dir>: the output of tools/package.py (www/, logger, gateway, tools, rules, docs, VERSION).
@@ -46,7 +47,7 @@ install -m 644 "$PKG/etc/kismet-archimet.conf" "$R/etc/archimet/"
 } > "$R/etc/apt/preferences.d/archimet-kismet"
 chmod 644 "$R/etc/apt/preferences.d/archimet-kismet"
 install -m 644 "$PKG/debian/copyright" "$R/usr/share/doc/archimet/"
-for d in README.md NOTICE.md LICENSE UPDATES.md SECURITY.md INSTALL.md HTTPS.md HOTSPOT.md DATA.md RECOVERY.md FEATURES.md COMPARISON.md STATUS.md HOW-IT-WORKS.md LE-DETECTION.md REPOSITORY.md HARDWARE.md USER-GUIDE.md CONFIGURATION.md FAQ.md; do
+for d in README.md NOTICE.md LICENSE UPDATES.md SECURITY.md INSTALL.md HTTPS.md HOTSPOT.md DATA.md RECOVERY.md FEATURES.md COMPARISON.md STATUS.md; do
     [ -f "$STAGE/docs/$d" ] && install -m 644 "$STAGE/docs/$d" "$R/usr/share/doc/archimet/"
 done
 gzip -9n -c > "$R/usr/share/doc/archimet/changelog.gz" <<EOF

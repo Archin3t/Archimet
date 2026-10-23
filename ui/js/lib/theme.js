@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Apply browser preferences to the document (colours, density, motion, marker style). */
 
 import { prefsGet } from "./store.js";

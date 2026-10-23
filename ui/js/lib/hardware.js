@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Pi hardware readings (logger metrics.json) matched to Kismet sources. Pure functions. */
 
 const NA = (v) => v == null || (typeof v === "object" && "unavailable" in v);

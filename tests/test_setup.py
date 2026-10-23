@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Tests for pi/archimet-setup (optional hotspot). Pure parts only: nothing here runs nmcli."""
 import importlib.machinery
 import importlib.util

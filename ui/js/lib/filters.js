@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Device category filter. A device is listed when it belongs to ANY checked category.
  * Kismet ORs regex pairs (verified on 2025.09), so one server-side query returns each device
  * once: no duplicates, no client-side merging. Pure functions (tests/test_ui.mjs). */

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* When an LE / Review device was really heard. Pure functions (tests/test_ui.mjs).
  *
  * "Heard recently" means Kismet's own last_time for the MAC is within HEARD_WINDOW of Kismet's

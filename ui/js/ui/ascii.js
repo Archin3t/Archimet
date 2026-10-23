@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Real-text ASCII lettering for the Archimet intro.
  * Letter faces are ANSI Shadow block characters; the box-drawing "shadow" strokes are
  * coloured separately, and a few hand-placed drips and worn cells give a restrained

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Archimet opening: full-screen, about five seconds, on every top-level load of Archimet
  * (new tab or refresh; never on in-app navigation, which does not reload the page).
  * The title is real text (ANSI Shadow block characters, see ascii.js). The session check runs

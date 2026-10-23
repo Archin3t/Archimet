@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // node tests/test_ui.mjs — pure parts of the v2 frontend (compatibility check, classification, RRD maths).
 import fs from "fs";
 import { check, checkLogger, loggerVersion } from "../ui/js/api/compat.js";
@@ -476,5 +477,6 @@ t("Bluetooth FHSS / nominal 2400: band only, no channel claimed", /nominal; no c
 { const lk = { ok: true, kismetNow: 10000, kismetStart: 9000, last: new Map([["AA:AA:AA:AA:AA:01", 8500], ["AA:AA:AA:AA:AA:02", 9950]]) };
   t("record older than Kismet's start: before this run", heardStatus("AA:AA:AA:AA:AA:01", lk).state === "earlier" && /before this Kismet run/.test(heardStatus("AA:AA:AA:AA:AA:01", lk).label));
   t("record within the window: recent", heardStatus("AA:AA:AA:AA:AA:02", lk).state === "recent"); }
+t("old stored reason wording is shown without 'confirmed'", reasonParts("Learned: associated client of confirmed LE AP 00:25:DF:00:00:01 (Vendor)").text === "associated client of LE-log AP 00:25:DF:00:00:01 (Vendor)");
 if (failed) { console.error(`${failed} failed`); process.exit(1); }
 console.log("ui tests passed");

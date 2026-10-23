@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Kismet REST API (2025.09). Every endpoint the UI uses is listed here and in contract.json. */
 
 import { request } from "./http.js";

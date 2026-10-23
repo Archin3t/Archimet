@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Archimet sign-in and first setup. The account is the Pi's single Archimet account (stored by the
  * Kismet engine, which keeps one login). The password is sent once to the sign-in check and is not
  * kept anywhere by Archimet; the session cookie is HttpOnly and only archimet-gateway can end it. */

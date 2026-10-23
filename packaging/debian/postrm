@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Data is never deleted here: the Archimet databases, Kismet's ~/.kismet (login, names, notes) and
 # any backups stay where they are, also on purge. Kismet itself stays installed (it is not ours).
 set -e

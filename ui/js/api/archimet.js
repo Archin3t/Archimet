@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Archimet logger API (LE log, Review, sightings, operator actions). */
 
 import { request } from "./http.js";
@@ -36,6 +37,9 @@ export const archimet = {
     /* Read-only Archive of everything stored, across capture runs (logger 5.2). */
     archive: ({ table = "ap", q = "", page = 0, length = 50, sort = "", dir = "desc" } = {}) =>
         request(BASE + "archive.json?" + new URLSearchParams({ table, q, page: String(page), length: String(length), sort, dir })),
+    /* Several sources at once (["ap","le"] or ["all"]): one labelled schema, read-only (logger 5.3). */
+    archiveMulti: ({ tables, q = "", page = 0, length = 50 } = {}) =>
+        request(BASE + "archive.json?" + new URLSearchParams({ tables: tables.join(","), q, page: String(page), length: String(length) })),
     known: (macs) => request(BASE + "known.json", { json: { macs } }),
     mark: (mac, note) => request(BASE + "mark", { json: { mac, note } }),
     unmark: (mac, note) => request(BASE + "unmark", { json: { mac, note } }),

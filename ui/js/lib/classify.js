@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* How a device is shown: category (glyph + label + radio tag) and its tags (lib/tags.js).
  * Pure functions; the logger is the only classifier, this only reads its results. */
 
@@ -14,7 +15,7 @@ export function kindOf(reason) {
 }
 
 export function parentOf(reason) {
-    const m = /confirmed LE (?:AP|device) ([0-9A-F]{2}(?::[0-9A-F]{2}){5})/.exec(String(reason || ""));
+    const m = /(?:confirmed LE|LE-log) (?:AP|device) ([0-9A-F]{2}(?::[0-9A-F]{2}){5})/.exec(String(reason || ""));   // 5.3 wording, and older stored rows
     return m ? m[1] : "";
 }
 

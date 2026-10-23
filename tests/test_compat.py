@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Tests for pi/archimet-compat's logger version gate (fails closed).
 
   python -m unittest tests.test_compat -v

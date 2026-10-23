@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Group repeated, identical Kismet alerts for display. Identical = same header, text,
  * transmitter, source, destination and channel; nothing else is merged. Kismet's records are
  * untouched: every occurrence stays listed with its own time. Pure (tests/test_ui.mjs). */

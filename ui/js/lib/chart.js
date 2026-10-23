@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Tiny SVG charts and Kismet RRD handling. No libraries. */
 
 /* Kismet RRD vectors are ring buffers indexed by time; return them oldest → newest. */

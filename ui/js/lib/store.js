@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Browser-only preferences (this browser). Server-wide settings live in Kismet / the logger
  * and are never stored here. Storage can be blocked; everything falls back to defaults. */
 

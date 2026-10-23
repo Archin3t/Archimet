@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Sources (Kismet data sources) and Channels. Tuning is receive-only (lock/hop). */
 
 import { sourceStates } from "../lib/sources.js";
@@ -159,18 +160,22 @@ route("sources", {
                         { actions: [["Cancel", null, "ghost"], ["Lock", () => sel.value, "primary"]] });
                     if (v) act("Channel locked", () => kismet.lockChannel(uuid, v));
                 };
-                grid.append(h("section", { class: "frame" },
+                grid.append(h("section", { class: "frame src-card" },
                     h("div", { class: "frame-head" }, h("span", { class: "eyebrow" }, s["kismet.datasource.name"]), h("span", { class: `badge ${state[1]}`, title: state[2] }, state[0])),
                     h("div", { class: "frame-body" },
                         h("dl", { class: "kv" },
                             h("dt", {}, "Interface"), h("dd", { class: "mono" }, `${s["kismet.datasource.interface"]}${s["kismet.datasource.capture_interface"] && s["kismet.datasource.capture_interface"] !== s["kismet.datasource.interface"] ? " → " + s["kismet.datasource.capture_interface"] : ""}`),
                             h("dt", {}, "Driver"), h("dd", { class: "mono" }, `${s["kismet.datasource.type_driver"] ? s["kismet.datasource.type_driver"]["kismet.datasource.driver.type"] || "" : ""} ${s["kismet.datasource.hardware"] || ""}`),
-                            h("dt", {}, "Listening"), h("dd", {}, hop ? `hopping ${chans.length} channels at ${s["kismet.datasource.hop_rate"]}/s` : `locked on ${s["kismet.datasource.channel"] || "—"}`),
+                            h("dt", {}, "Listening"), h("dd", {}, hop ? `hopping ${chans.length} channels at ${s["kismet.datasource.hop_rate"]}/s`
+                                : s["kismet.datasource.channel"] ? `locked on ${s["kismet.datasource.channel"]}`
+                                : "no channel control (this source scans; it does not tune)"),
                             h("dt", {}, "Packets"), h("dd", { class: "mono" }, `${num(s["kismet.datasource.num_packets"])} · ${num(s["kismet.datasource.num_error_packets"])} errors`),
                             s["kismet.datasource.warning"] ? h("dt", {}, "Warning") : null, s["kismet.datasource.warning"] ? h("dd", { class: "dim" }, s["kismet.datasource.warning"]) : null,
                             errored ? h("dt", {}, "Error") : null, errored ? h("dd", {}, s["kismet.datasource.error_reason"] || "") : null),
                         h("div", { class: "panel-chart" }, sparkline(pk, { width: 300, height: 46 })),
-                        hardware(s), history(s),
+                        // Secondary detail folds on phones; open by default on wider screens.
+                        h("details", { class: "src-more", open: !matchMedia("(max-width: 720px)").matches },
+                            h("summary", {}, "Hardware and history"), hardware(s), history(s)),
                         h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "12px" } },
                             chans.length ? h("button", { class: "btn", type: "button", disabled: ro || !running, onclick: lock }, "Lock channel…") : null,
                             chans.length && !hop ? h("button", { class: "btn", type: "button", disabled: ro || !running, onclick: () => act("Hopping", () => kismet.hopChannels(uuid)) }, "Hop all channels") : null,

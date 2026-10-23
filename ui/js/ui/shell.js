@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Archimet shell: navigation, status strip, routing, toasts, dialogs. */
 
 import { h, svg, clear, relTime } from "../lib/util.js";

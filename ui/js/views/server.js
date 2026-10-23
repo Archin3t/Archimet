@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Alerts, SSIDs, Messages, System. */
 
 import { h, svg, clear, relTime, absTime, duration, bytes, num, macSearch, debounce, get, requestGate } from "../lib/util.js";

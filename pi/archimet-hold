@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Keep the Kismet engine at the version this Archimet release was tested with.
 #   archimet-hold apply     hold kismet-core and the two capture helpers (only at the tested version)
 #   archimet-hold status    installed vs tested versions, hold state, apt candidate (newer releases)

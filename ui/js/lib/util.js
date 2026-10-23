@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Small, dependency-free helpers. All text goes in through textContent; no innerHTML with data. */
 
 export function h(tag, attrs, ...kids) {

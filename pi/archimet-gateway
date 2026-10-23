@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Archinet
 """Archimet gateway: the only network-facing web entry point of an Archimet Pi.
 
@@ -23,10 +23,13 @@ Setup lock (server side, not a UI warning):
     user name, at least 10 characters).
 
 Sessions:
-  * Kismet's session cookie (KISMET) is accepted only if the gateway issued it (sign-in through the
-    gateway). A credential change, or "sign out" (POST /archimet-session/logout), ends the sessions,
-    so old sessions stop working at once. Restarting the gateway signs everyone out.
-  * Set-Cookie from Kismet is passed back with HttpOnly, SameSite=Strict, and Secure under TLS.
+  * The browser holds the gateway's own random token (cookie ARCHIMET), never Kismet's session cookie.
+    The gateway maps it to the Kismet session it obtained at sign-in. Kismet re-issues the SAME session
+    token to every sign-in with the same credentials and keeps it after a credential change (measured
+    on 2025-09-R1), so revoking Kismet tokens could not work; revoking gateway tokens does.
+  * A credential change ends every session; "sign out" (POST /archimet-session/logout) ends the
+    caller's; 2 hours without use ends one; restarting the gateway ends all.
+  * The cookie is HttpOnly and SameSite=Strict, and Secure under HTTPS.
 
 TLS: certificate and key from systemd credentials (LoadCredential server.crt / server.key, made by
 archimet-tls) or ARCHIMET_TLS_CERT / ARCHIMET_TLS_KEY paths. A plain-HTTP request on the TLS port is
@@ -44,6 +47,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import sys
@@ -118,15 +122,30 @@ def kismet_route(method, path):
     return any(method in m and r.match(path) for m, r in ROUTES)
 
 
+WWW_INDEX = {}
+
+
+def index_www():
+    """Map every servable file under WWW once, at start: "js/app.js" -> its Path. Request data is only ever
+    a key into this map, never part of a filesystem path (no traversal, symlink or race to get wrong).
+    Skipped: dot-files / dot-directories, and anything that resolves outside WWW (e.g. a symlink)."""
+    out = {}
+    for d, dirs, files in os.walk(WWW):
+        dirs[:] = sorted(x for x in dirs if not x.startswith("."))
+        for name in files:
+            if name.startswith("."):
+                continue
+            f = Path(d, name).resolve()
+            if f.is_relative_to(WWW) and f.is_file():
+                out[f.relative_to(WWW).as_posix()] = f
+    WWW_INDEX.clear()
+    WWW_INDEX.update(out)
+    return len(out)
+
+
 def static_file(path):
-    """The file under WWW for a URL path, or None. Never follows a path out of WWW."""
-    rel = path.lstrip("/") or "index.html"
-    if "\\" in rel or "\0" in rel or any(p in ("", ".", "..") or p.startswith(".") for p in rel.split("/")):
-        return None
-    f = (WWW / rel).resolve()
-    if not f.is_relative_to(WWW) or not f.is_file():
-        return None
-    return f
+    """The indexed file for a URL path, or None (request data is only a dictionary key)."""
+    return WWW_INDEX.get(path.lstrip("/") or "index.html")
 
 
 def is_loopback(addr):
@@ -189,33 +208,47 @@ class Setup:
 
 
 class Sessions:
-    """KISMET cookies issued through this gateway. Bounded; cleared by a credential change."""
+    """Gateway session tokens -> the Kismet session behind each. Bounded; idle tokens expire."""
+    IDLE = 7200
+
     def __init__(self, cap=512):
         self.lock, self.cap, self.ids = threading.Lock(), cap, collections.OrderedDict()
 
-    def add(self, sid):
+    def add(self, kismet_sid):
+        token = secrets.token_urlsafe(32)
         with self.lock:
-            self.ids[sid] = time.time()
-            self.ids.move_to_end(sid)
+            self.ids[token] = [kismet_sid, time.monotonic()]
             while len(self.ids) > self.cap:
                 self.ids.popitem(last=False)
+        return token
 
-    def known(self, sid):
+    def kismet(self, token):
+        """The Kismet session for a live token (and refresh its idle timer), else None."""
+        if not token:
+            return None
         with self.lock:
-            return sid in self.ids
+            v = self.ids.get(token)
+            if not v:
+                return None
+            if time.monotonic() - v[1] > self.IDLE:
+                del self.ids[token]
+                return None
+            v[1] = time.monotonic()
+            self.ids.move_to_end(token)
+            return v[0]
 
-    def drop(self, sid=None):
+    def drop(self, token=None):
         with self.lock:
-            if sid is None:
+            if token is None:
                 self.ids.clear()
             else:
-                self.ids.pop(sid, None)
+                self.ids.pop(token, None)
 
 
 SETUP, SESSIONS = Setup(), Sessions()
 
 
-def cookie_value(header, name="KISMET"):
+def cookie_value(header, name="ARCHIMET"):
     for part in (header or "").split(";"):
         k, _, v = part.strip().partition("=")
         if k == name:
@@ -262,14 +295,13 @@ class Gateway(BaseHTTPRequestHandler):
 
     def _cookie(self, value, clear=False):
         attrs = "; Path=/; HttpOnly; SameSite=Strict" + ("; Secure" if self.tls else "")
-        return f"KISMET={'' if clear else value}{attrs}" + ("; Max-Age=0" if clear else "")
+        return f"ARCHIMET={'' if clear else value}{attrs}" + ("; Max-Age=0" if clear else "")
 
-    def _proxy(self, base, path_qs, body, session_ok, before_reply=None):
+    def _proxy(self, base, path_qs, body, kismet_sid, before_reply=None):
         h = {k: self.headers[k] for k in ("Authorization", "Content-Type", "Origin", "X-Archimet", "Accept")
              if self.headers.get(k)}
-        sid = cookie_value(self.headers.get("Cookie"))
-        if sid and session_ok:
-            h["Cookie"] = "KISMET=" + sid           # only Kismet's session cookie, and only one we issued
+        if kismet_sid:
+            h["Cookie"] = "KISMET=" + kismet_sid     # the Kismet session behind a live gateway token, nothing else
         h["Host"] = self.headers.get("Host") or ""  # the logger's Origin check compares against it
         req = urllib.request.Request(base + path_qs, data=body if self.command == "POST" else None, headers=h,
                                      method=self.command)
@@ -284,12 +316,13 @@ class Gateway(BaseHTTPRequestHandler):
             return 502, None
         extra, issued = [("Cache-Control", "no-store")], None
         for c in rh.get_all("Set-Cookie") or []:
-            v = cookie_value(c.split(";", 1)[0])
+            v = cookie_value(c.split(";", 1)[0], "KISMET")
             if v is not None:
-                issued = v
-                extra.append(("Set-Cookie", self._cookie(v)))
+                issued = v                           # kept by the gateway; never passed to the browser
         if before_reply:
-            before_reply(code, issued)           # state changes land before the client can act on the reply
+            token = before_reply(code, issued)       # state changes land before the client can act on the reply
+            if token:
+                extra.append(("Set-Cookie", self._cookie(token)))
         self._send(code, data, rh.get("Content-Type") or "application/octet-stream", extra)
         return code, issued
 
@@ -328,16 +361,16 @@ class Gateway(BaseHTTPRequestHandler):
                    "defaultUser": DEFAULT_USER if state == "default" else ""}
             return self._send(200, json.dumps(cfg).encode(), "application/json", [("Cache-Control", "no-store")],
                               self.command == "HEAD")
-        sid = cookie_value(self.headers.get("Cookie"))
-        session_ok = bool(sid) and SESSIONS.known(sid)
+        token = cookie_value(self.headers.get("Cookie"))
+        ksid = SESSIONS.kismet(token)
         if path == "/archimet-session/logout" and self.command == "POST":
-            if sid:
-                SESSIONS.drop(sid)
+            if token:
+                SESSIONS.drop(token)
             return self._json(200, {"signed_out": True}, [("Set-Cookie", self._cookie("", clear=True))])
         if path.startswith("/archimet/"):
             if setup and path != "/archimet/health":
                 return self._json(403, {"error": "setup required", "detail": "change the default password first"})
-            self._proxy(LOGGER, path_qs, body, session_ok)
+            self._proxy(LOGGER, path_qs, body, ksid)
             return None
         if kismet_route(self.command, path):
             if setup and path not in SETUP_ROUTES:
@@ -354,9 +387,10 @@ class Gateway(BaseHTTPRequestHandler):
                 if path == "/session/set_password" and code == 200:
                     SESSIONS.drop()                 # every existing session ends with the old credentials
                     SETUP.state(force=True)
-                elif issued and code == 200 and path.startswith("/session/"):
-                    SESSIONS.add(issued)
-            self._proxy(KISMET, path_qs, body, session_ok, before_reply)
+                elif path == "/session/check_login" and code == 200 and issued:
+                    return SESSIONS.add(issued)     # a new gateway token for this sign-in
+                return None
+            self._proxy(KISMET, path_qs, body, ksid, before_reply)
             return None
         if self.command in ("GET", "HEAD"):
             f = static_file(path)
@@ -410,6 +444,7 @@ class Server(ThreadingHTTPServer):
 
 def make_server(bind=None):
     host, _, port = (bind or BIND).rpartition(":")
+    index_www()                      # the web root is fixed package content: indexed once
     srv = Server((host.strip("[]") or "0.0.0.0", int(port)), Gateway)
     cert, key = ENV("ARCHIMET_TLS_CERT", "server.crt"), ENV("ARCHIMET_TLS_KEY", "server.key")
     # Bare names come from systemd LoadCredential= (the gateway's DynamicUser cannot read /etc keys).

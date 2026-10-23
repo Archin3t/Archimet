@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """The logger must keep collecting after Kismet changes its password."""
 
 import base64

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # archimet postinst. Archimet runs ON the upstream Kismet packages (kismet-core and the Linux Wi-Fi /
 # Bluetooth capture helpers, exact tested versions). It never modifies files those packages own.
 # Never touches: NetworkManager, hotspot profiles, capture-source definitions (kismet_site.conf),

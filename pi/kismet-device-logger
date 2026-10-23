@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Poll Kismet's local API and keep three de-duplicated device logs.
 
   access_points.sqlite    Wi-Fi APs / ad-hoc / WDS (anything broadcasting a network)
@@ -219,7 +220,7 @@ def review_decision(rules, row, last_obs, now):
     if weak and name.strip().lower() in rules.public:
         return ("dismissed", "public-hotspot",
                 f"Network name “{name}” is a public / ISP hotspot name (rules: public_ssids); signals: {', '.join(kinds)}.",
-                "A public hotspot is used by many people and devices, so a confirmed LE device joining it, or a word near "
+                "A public hotspot is used by many people and devices, so an LE-log device joining it, or a word near "
                 "it, says nothing about who runs it.",
                 "Nothing further is needed. A vendor MAC prefix or a model name on this device would reopen it.", basis)
     # A typed agency word on a consumer maker's radio: weak, but ownership is NOT disproved (an agency
@@ -232,12 +233,12 @@ def review_decision(rules, row, last_obs, now):
                 "The only positive signal is a word anyone can type into a network name, on consumer hardware. That is "
                 "not evidence of LE equipment, but it does not prove the network is unrelated to an agency either.",
                 "Who runs this network. A fleet or LE vendor MAC prefix, an LE model name, or a data-frame link to a "
-                "confirmed LE device would make it active again.", basis)
+                "LE-log device would make it active again.", basis)
     if weak:
         return ("deprioritized", "weak-only",
                 "Signals: " + ", ".join(kinds) + (f" (word {', '.join(words)})" if words else "") + (f"; manufacturer “{manuf}”" if manuf else ""),
                 "Only signals that can never confirm LE on their own (a typed word, a probe, an adjacent MAC, a shared AP).",
-                "Whether it is LE equipment at all. A vendor MAC prefix, a model name or a data-frame link to confirmed LE "
+                "Whether it is LE equipment at all. A vendor MAC prefix, a model name or a data-frame link to an LE-log device "
                 "would make it active again.", basis)
     if days is not None and days > REVIEW_STALE_DAYS:
         return ("deprioritized", "stale",
@@ -304,7 +305,10 @@ def kind_of(reason):
     return "keyword" if parts else ""
 
 
-PARENT_RE = re.compile(r"confirmed LE (?:AP|device) ([0-9A-F]{2}(?::[0-9A-F]{2}){5})")
+# Stored reasons name the parent as "LE-log AP/device <MAC>" (logger 5.3) or "confirmed LE AP/device <MAC>" (older rows).
+# An Origin header as browsers send it: scheme://host[:port], printable, no path, no control characters.
+ORIGIN_RE = re.compile(r"https?://(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::[0-9]{1,5})?")
+PARENT_RE = re.compile(r"(?:confirmed LE|LE-log) (?:AP|device) ([0-9A-F]{2}(?::[0-9A-F]{2}){5})")
 
 
 def parent_of(reason):
@@ -1127,7 +1131,7 @@ class Logs:
 
         def learned_count(p):
             return self.le.execute("SELECT COUNT(*) FROM law_enforcement WHERE match_reason LIKE ?",
-                                   (f"Learned: associated client of confirmed LE AP {p}%",)).fetchone()[0]
+                                   (f"Learned: associated client of % AP {p}%",)).fetchone()[0]
 
         def unconfirmed(dev, p, role, probed_from):
             """A client record without data-frame evidence: Review, promoted later if data appears."""
@@ -1135,7 +1139,7 @@ class Logs:
             n += self.review_upsert(dev, [{
                 "kind": "association-unconfirmed", "parent": p, "role": role,
                 "directed_probe": p in (probed_from.get("probe_bssids") or []),
-                "detail": f"client record with confirmed LE {'AP' if role == 'ap' else 'device'} {p}, no data frames"}])
+                "detail": f"client record with LE-log {'AP' if role == 'ap' else 'device'} {p}, no data frames"}])
 
         def learn_client(c, p, rec):
             nonlocal n
@@ -1151,9 +1155,9 @@ class Logs:
             have = learned_count(p)
             if have >= rules.max_clients:
                 n += self.review_upsert(c, [{"kind": "parent-full", "parent": p, "count": have,
-                                             "detail": f"association with confirmed LE AP {p} (cap reached)"}])
+                                             "detail": f"association with LE-log AP {p} (cap reached)"}])
                 return
-            reason = (f"Learned: associated client of confirmed LE AP {p} ({parent_label(p)}); "
+            reason = (f"Learned: associated client of LE-log AP {p} ({parent_label(p)}); "
                       f"evidence: Kismet client record for BSSID {p} shows {rec['evidence']} (data frames need a "
                       f"completed association); record first {ts(rec['first']) if rec['first'] else '?'} "
                       f"last {ts(rec['last']) if rec['last'] else '?'}; recorded {ts(None)}")
@@ -1178,9 +1182,9 @@ class Logs:
                 why = f"{len(a['assoc_clients'])} associated clients"
             if why:
                 n += self.review_upsert(a, [{"kind": "shared-ap", "parent": h, "why": why,
-                                             "detail": f"association from confirmed LE device {h}; {why}"}])
+                                             "detail": f"association from LE-log device {h}; {why}"}])
                 return
-            reason = (f"Learned: access point joined by confirmed LE device {h} ({parent_label(h)}); "
+            reason = (f"Learned: access point joined by LE-log device {h} ({parent_label(h)}); "
                       f"evidence: Kismet client record of {h} for this BSSID shows {rec['evidence']} (data frames need "
                       f"a completed association); record first {ts(rec['first']) if rec['first'] else '?'} "
                       f"last {ts(rec['last']) if rec['last'] else '?'}; recorded {ts(None)}")
@@ -1217,7 +1221,7 @@ class Logs:
                     p = conf_ssids.get(s.lower())
                     if p and p != mac and mac not in conf and s.lower() not in rules.public:
                         n += self.review_upsert(d, [{"kind": "probe-confirmed-ssid", "parent": p, "ssid": s,
-                                                     "detail": f"probed “{s}” (SSID of confirmed LE AP {p})"}])
+                                                     "detail": f"probed “{s}” (SSID of LE-log AP {p})"}])
                 if mac in conf:
                     if ap_ssids is None:
                         ap_ssids = collections.defaultdict(set)
@@ -1236,7 +1240,7 @@ class Logs:
                             a = get(m2) or self.ap_from_log(m2)
                             if a:
                                 n += self.review_upsert(a, [{"kind": "probed-by-confirmed", "parent": mac, "ssid": s,
-                                                             "detail": f"SSID “{s}” probed by confirmed LE device {mac}"}])
+                                                             "detail": f"SSID “{s}” probed by LE-log device {mac}"}])
             # Adjacent MAC to a confirmed device of the same block: Review note.
             if mac not in conf:
                 h = hexmac(mac)
@@ -1246,7 +1250,7 @@ class Logs:
                         nm = norm_mac(f"{nb & 0xFFFFFFFFFFFF:012X}")
                         if nm in conf and nm[:8] == mac[:8]:
                             n += self.review_upsert(d, [{"kind": "adjacent-mac", "parent": nm,
-                                                         "detail": f"adjacent to confirmed LE device {nm}"}])
+                                                         "detail": f"adjacent to LE-log device {nm}"}])
         return n
 
     def ap_from_log(self, mac):
@@ -1730,17 +1734,26 @@ class Api(BaseHTTPRequestHandler):
         pass
 
     def _origin(self):
-        """The Origin to echo, '' if none was sent, or None if it is not allowed."""
+        """The Origin to echo, '' if none was sent, or None if it is not allowed.
+
+        Never the raw header: urlsplit() silently drops CR / LF / TAB before parsing, so a value that
+        passes the host check could still carry a line break into the response (header injection). Any
+        control character or unexpected shape is refused, and only the rebuilt scheme://host[:port] is
+        echoed."""
         origin = self.headers.get("Origin")
         if not origin:
             return ""
+        if not ORIGIN_RE.fullmatch(origin):
+            return None
         try:
             o = urllib.parse.urlsplit(origin)
             host = urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname
+            port = o.port
         except ValueError:
             return None
         if o.scheme in ("http", "https") and o.hostname and host and o.hostname == host:
-            return origin
+            h = f"[{o.hostname}]" if ":" in o.hostname else o.hostname
+            return f"{o.scheme}://{h}" + (f":{port}" if port else "")
         return None
 
     def _send(self, code, obj, origin=""):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Checks the running Kismet against contract.json. Pure check() is shared with tests. */
 
 import { request } from "./http.js";

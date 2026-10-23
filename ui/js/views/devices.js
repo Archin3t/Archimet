@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Devices: one view control, one search box, concise rows, inspector on click. */
 
 import { h, svg, clear, relTime, absTime, macSearch, debounce, requestGate } from "../lib/util.js";
@@ -231,7 +232,12 @@ route("devices", {
                                 ? [h("span", { class: "name" }, id.name), h("span", { class: "mac" }, mac)]
                                 : [h("span", { class: "name mono macname" }, mac), h("span", { class: "mac idlabel" + (id.hidden ? " hidden-ssid" : ""), title: id.reason }, id.label)],
                             h("span", { class: "sub mac", title: radioTitle(bd) }, bd.conflict ? h("span", { class: "band-conflict" }, bd.conflict.text) : bd.short,
-                                ` · ch ${bd.differ ? bd.differ.short : r["kismet.device.base.channel"] || "—"} · ${sig ? sig + " dBm" : "—"} · ${relTime(r["kismet.device.base.last_time"])}`))),
+                                // Bluetooth: Kismet's channel is "FHSS" (frequency hopping), not a channel; the radio label says BLE / BT.
+                                `${/bluetooth/i.test(base.phy || "") ? "" : ` · ch ${bd.differ ? bd.differ.short : r["kismet.device.base.channel"] || "—"}`}`))),
+                    // Phones: freshness and signal in their own right-hand column (hidden on wider screens).
+                    h("div", { class: "m-meta", "aria-hidden": "true" },
+                        h("span", { class: "m-when", title: absTime(r["kismet.device.base.last_time"]) }, relTime(r["kismet.device.base.last_time"])),
+                        h("span", { class: "m-sig" }, sigBars(sig), sig ? `${sig} dBm` : "no signal")),
                     ...cols().map(([id]) => cells[id]),
                     h("div", { class: "badges" }, ...badges.map(b => h("span", { class: `badge b-${b.id}`, title: b.title || "" }, b.text))));
                 row.style.gridTemplateColumns = tpl;

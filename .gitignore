@@ -37,6 +37,8 @@
 !/tests/test_ui.mjs
 !/tests/test_gateway.py
 !/tests/test_resize.mjs
+!/tests/test_sources.mjs
+!/tests/test_tls.py
 !/tests/test_logger.py
 !/tests/test_compat.py
 !/tests/test_credentials_reload.py

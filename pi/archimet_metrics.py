@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Archimet hardware metrics for the Pi (stdlib only, read-only).
 
 collect() returns a snapshot: CPU temperature and clock, throttling / under-voltage flags,

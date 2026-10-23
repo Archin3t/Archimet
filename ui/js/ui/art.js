@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Original Archimet artwork: the mark and the icon set. */
 
 /* Hexagon (the enclosure) with an A whose apex carries two receive arcs: Archimet listens. */

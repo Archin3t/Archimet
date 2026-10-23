@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Build the staging bundle that packaging/build-deb.sh turns into the archimet .deb.
 
     python tools/package.py            # -> dist/archimet-<version>/ and dist/archimet-<version>.tar.gz
@@ -43,13 +44,6 @@ FILES = {
     "docs/FEATURES.md": "docs/FEATURES.md",
     "docs/COMPARISON.md": "docs/COMPARISON.md",
     "docs/STATUS.md": "docs/STATUS.md",
-    "docs/HOW-IT-WORKS.md": "docs/HOW-IT-WORKS.md",
-    "docs/LE-DETECTION.md": "docs/LE-DETECTION.md",
-    "docs/REPOSITORY.md": "docs/REPOSITORY.md",
-    "docs/HARDWARE.md": "docs/HARDWARE.md",
-    "docs/USER-GUIDE.md": "docs/USER-GUIDE.md",
-    "docs/CONFIGURATION.md": "docs/CONFIGURATION.md",
-    "docs/FAQ.md": "docs/FAQ.md",
 }
 EXEC = {"kismet-device-logger", "archimet-gateway", "archimet-compat", "archimet-setup", "archimet-hold",
         "archimet-selftest", "archimet-tls", "archimet-account"}

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Tags: the one catalogue for what a device row says about itself. Pure functions (tests/test_ui.mjs).
  *
  * Three separate things, never mixed:
@@ -111,7 +112,8 @@ export function tagsFor({ mac, phy, type, name, ssid }, o, r, known, kismetStart
  * that category describes the rule, not the device, so it is returned separately and never shown
  * as the device's type. Stored rows are not changed. -> { kind, text, ruleCategory } */
 export function reasonParts(reason) {
-    const r = String(reason || "").trim();
+    // Rows stored before logger 5.3 say "confirmed LE AP/device"; shown in today's wording (the stored row is unchanged).
+    const r = String(reason || "").trim().replace(/\bconfirmed LE (AP|device)\b/g, "LE-log $1");
     const m = /^(\w+):\s*(.*)$/s.exec(r);
     if (!m) return { kind: "", text: r, ruleCategory: "" };
     const kind = m[1].toLowerCase();

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Capture-source state from Kismet's own fields AND packet progress. Pure (tests/test_ui.mjs).
  *
  * Kismet's "running" only means the source is open. A source counts as CAPTURING only when its packet

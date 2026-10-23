@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Tests for pi/kismet-device-logger against fixtures and a fake Kismet API.
 
   python -m unittest tests/test_logger.py -v
@@ -236,7 +237,7 @@ class Learning(Base):
         rnd = dev("DA:A1:19:00:00:01", manuf="Unknown", assoc_to=["00:30:44:00:00:17"])
         self.poll([E110_A, rnd])
         r = self.le("DA:A1:19:00:00:01")
-        self.assertTrue(r["match_reason"].startswith("Learned: associated client of confirmed LE AP 00:30:44:00:00:17"))
+        self.assertTrue(r["match_reason"].startswith("Learned: associated client of LE-log AP 00:30:44:00:00:17"))
         self.assertIn("evidence: Kismet client record for BSSID 00:30:44:00:00:17 shows 3 retried data frames", r["match_reason"])
         self.assertEqual(K.parent_of(r["match_reason"]), "00:30:44:00:00:17")
         self.assertEqual(r["category"], "associated (learned)")
@@ -251,7 +252,7 @@ class Learning(Base):
         self.poll([cam, ap, bystander])
         self.assertTrue(self.le("00:25:DF:11:22:33")["match_reason"].startswith("Hardware:"))
         a = self.le("10:20:30:40:50:60")
-        self.assertTrue(a["match_reason"].startswith("Learned: access point joined by confirmed LE device 00:25:DF:11:22:33"))
+        self.assertTrue(a["match_reason"].startswith("Learned: access point joined by LE-log device 00:25:DF:11:22:33"))
         self.assertIsNone(self.le("AA:00:00:00:00:01"))     # learned AP is not a parent
 
     def test_shared_or_public_ap_is_not_learned(self):
@@ -634,6 +635,33 @@ class ApiTests(Base):
         for t in K.Logs.ARCHIVE:
             self.assertEqual(self.call(f"/archimet/archive.json?table={t}")[0], 200, t)
 
+    def raw_request(self, origin_lines):
+        """A raw HTTP request, so the Origin header can be shaped as no client library would send it."""
+        import socket
+        req = (f"GET /archimet/health HTTP/1.1\r\nHost: 127.0.0.1:{self.srv.server_port}\r\n{origin_lines}"
+               f"Authorization: {GOOD}\r\nConnection: close\r\n\r\n").encode("latin-1")
+        with socket.create_connection(("127.0.0.1", self.srv.server_port), timeout=10) as s:
+            s.sendall(req)
+            data = b""
+            while chunk := s.recv(4096):
+                data += chunk
+        return data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+
+    def test_origin_never_splits_the_response(self):
+        """CodeQL py/http-response-splitting (2026-10-23): the raw Origin was echoed after a host check that
+        urlsplit() passes even when the value carries a folded line. Now: refused, or echoed rebuilt."""
+        host = f"127.0.0.1:{self.srv.server_port}"
+        for bad in (f"Origin: http://{host}\r\n X-Injected: 1\r\n",                 # obs-fold continuation line
+                    f"Origin: http://{host}\r\n\tSet-Cookie: KISMET=evil\r\n",      # tab-folded
+                    f"Origin: http://{host}/path\r\n",                               # not an origin
+                    "Origin: javascript://127.0.0.1\r\n"):
+            head = self.raw_request(bad)
+            lines = head.split("\r\n")
+            self.assertFalse(any(l.lstrip().lower().startswith(("x-injected", "set-cookie")) for l in lines), head)
+            self.assertFalse(any(l.startswith("Access-Control-Allow-Origin") for l in lines), head)
+        head = self.raw_request(f"Origin: http://127.0.0.1:{self.srv.server_port}\r\n")
+        self.assertIn(f"Access-Control-Allow-Origin: http://{host}", head)            # canonical, rebuilt
+
     def test_archive_combined_sources(self):
         """Combined Archive search (2026-10-23): selected sources only, one labelled schema, the same MAC in
         two sources stays two rows, bounded paging, strict allowlist, parameterised search."""
@@ -775,7 +803,7 @@ class Evidence(Base):
         joined = dev("DA:00:00:00:0A:01", assoc_to=["00:30:44:00:00:17"], data=True)
         self.poll([E110_A, joined])
         self.assertTrue(self.le("DA:00:00:00:0A:01")["match_reason"].startswith(
-            "Learned: associated client of confirmed LE AP 00:30:44:00:00:17"))
+            "Learned: associated client of LE-log AP 00:30:44:00:00:17"))
         self.assertEqual(self.rv("DA:00:00:00:0A:01")["status"], "promoted")
 
     def test_hardware_client_ap_needs_data_frames_too(self):
