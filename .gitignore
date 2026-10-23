@@ -61,6 +61,7 @@
 !/docs/USER-GUIDE.md
 !/docs/CONFIGURATION.md
 !/docs/FAQ.md
+!/docs/intro.gif
 
 __pycache__/
 *.pyc
