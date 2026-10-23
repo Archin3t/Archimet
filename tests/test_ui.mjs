@@ -18,6 +18,15 @@ import { detectHardware, sourceDefinition, recheckAvailable, isHotspotIface } fr
 let failed = 0;
 const t = (name, cond) => { if (!cond) { failed++; console.error("FAIL", name); } };
 
+// A browser can hold malformed preference JSON; merging it must never mutate prototypes.
+globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+const { prefsSet, prefsGet, prefsReset } = await import("../ui/js/lib/store.js");
+prefsSet(JSON.parse('{"__proto__":{"archimetPolluted":true},"tags":{"__proto__":{"archimetPolluted":true}},"density":"compact"}'));
+t("malformed preferences cannot pollute Object.prototype", Object.prototype.archimetPolluted === undefined);
+t("valid preferences still merge", prefsGet().density === "compact");
+prefsReset();
+delete globalThis.localStorage;
+
 const ordered = [
     { id: "weak", "kismet.device.base.last_time": 200, signal: -83 },
     { id: "old", "kismet.device.base.last_time": 199, signal: -25 },
