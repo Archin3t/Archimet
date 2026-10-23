@@ -1,6 +1,6 @@
 # Installation guide
 
-**Current state:** Archimet 5.3.0-1 is a local candidate with no public download. This guide describes the intended installation from a future approved release. Do not treat isolated tests as proof of a fresh Pi installation; see [Release status](STATUS.md) and use a spare SD card when testing.
+**Current state:** The public GitHub Release contains source archives, but no approved installable `.deb`. Archimet 5.3.0-1 remains a local package candidate. This guide describes the intended installation from a future approved release. Do not treat isolated tests as proof of a fresh Pi installation; see [Release status](STATUS.md). If you test on your only Pi, first verify an off-Pi backup and a way to restore the previous system.
 
 ## Before you start
 
@@ -83,4 +83,4 @@ The self-test should end in `ALL PASS`. Inspect Sources for an opened helper, co
 
 ## Build from source (maintainers)
 
-The source tree contains `tools/package.py` to stage reviewed files and `packaging/build-deb.sh` to construct the arm64 `.deb` on a Debian build host with `dpkg-deb`. `tools/build_deb.py` can build through a separately configured Pi target. The package builder pins the three tested Kismet versions in its Debian control metadata and apt policy. A source build still needs real-hardware validation, a clean-install test, checksums and a public release report before it becomes an installable release for others. [Repository map](REPOSITORY.md), [Updates](UPDATES.md), [Status](STATUS.md).
+The source tree contains `tools/package.py` to stage reviewed files and `packaging/build-deb.sh` to construct the arm64 `.deb` on a Debian build host with `dpkg-deb`. The package builder pins the three tested Kismet versions in its Debian control metadata and apt policy. A source build still needs real-hardware validation, a clean-install test, checksums and a public release report before it becomes an installable release for others. [Repository map](REPOSITORY.md), [Updates](UPDATES.md), [Status](STATUS.md).

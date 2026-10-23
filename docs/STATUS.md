@@ -1,6 +1,6 @@
 # Release status
 
-**Archimet 5.3.0-1 is a local release candidate. Do not publish or treat it as production ready yet.** The reference Pi still runs Archimet 5.2.0-2. The candidate uses upstream Kismet 2025-09-R1 packages as exact dependencies.
+**The public GitHub Release is a source preview, not an approved installer.** Archimet 5.3.0-1 remains a local package candidate; do not publish its `.deb` or treat it as production ready yet. The reference Pi still runs Archimet 5.2.0-2. The candidate uses upstream Kismet 2025-09-R1 packages as exact dependencies.
 
 The 5.3 candidate passed isolated arm64 apt-policy tests, gateway write tests, first-run setup tests, an unauthenticated route audit and an API compatibility check. These are valuable checks, but they do not prove a fresh user installation on Pi hardware. The source implements a setup-only `archimet/archimet` account, mandatory password change and local HTTPS gate; those flows still need real-device verification.
 
