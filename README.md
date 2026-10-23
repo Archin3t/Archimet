@@ -4,7 +4,7 @@
 
 Archimet grew from a practical gap: general radio monitoring could show nearby Wi-Fi and Bluetooth devices, but it did not provide a clear way to collect, revisit, and assess *possible law enforcement equipment* across capture runs. Archimet organizes those observations and shows why each device was flagged. It does not identify an officer, prove ownership, or promise to detect every device.
 
-> **Release status:** The 5.3.0-1 package in this repository is a local candidate. It has passed isolated tests, but a clean installation and migration on the reference Pi, capture-power retest, phone layout, hotspot and second-device HTTPS checks remain open. There is no public release yet. See [release status](docs/STATUS.md).
+> **Release status:** This public repository currently provides source code only. Archimet 5.3.0-1 is a local package candidate, not an approved installer. It has passed isolated tests, but a clean installation and migration on the reference Pi, capture-power retest, phone layout, hotspot and second-device HTTPS checks remain open. Do not treat the source-preview GitHub Release as an installable release. See [release status](docs/STATUS.md).
 
 ## What it does
 
